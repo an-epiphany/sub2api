@@ -1030,6 +1030,17 @@ rate_limit:
   # Cooldown time (in minutes) when upstream returns 529 (overloaded)
   # 上游返回 529（过载）时的冷却时间（分钟）
   overload_cooldown_minutes: 10
+  # Ignore OpenAI 403 entirely: do not count / temp-unschedule / permanently disable the account.
+  # The original 403 is passed through to the client and the account stays usable.
+  # Use this to avoid Cloudflare browser-UA challenge 403s wrongly knocking out shared accounts.
+  # 设为 true 时完全忽略 OpenAI 403：不计数、不临时不可调度、不永久禁用，账号保持可用，
+  # 原始 403 透传给客户端。用于规避 Cloudflare 对浏览器型 UA 的质询 403 误伤共享账号。
+  openai_403_ignore: false
+  # Permanently disable an account only after this many consecutive 403s (within the 180-min window).
+  # <=0 falls back to the built-in default (3). Raise it so transient edge 403s don't kill healthy accounts.
+  # 连续 403 达到该次数才永久禁用账号（统计窗口 180 分钟）；<=0 回退到内置默认值(3)。
+  # 调大可避免瞬时的边缘 403 把健康账号判死。
+  openai_403_disable_threshold: 3
 
 # =============================================================================
 # Pricing Data Source (Optional)

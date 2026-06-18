@@ -86,3 +86,64 @@ func TestRateLimitService_HandleUpstreamError_OpenAI403ThresholdDisables(t *test
 	require.Contains(t, repo.lastErrorMsg, "workspace forbidden by policy")
 	require.Contains(t, repo.lastErrorMsg, "consecutive_403=3/3")
 }
+
+// 开关 rate_limit.openai_403_ignore=true：完全忽略 OpenAI 403——不计数、不临时不可调度、
+// 不永久禁用、不封锁，且返回 false（不触发 failover）。
+func TestRateLimitService_HandleUpstreamError_OpenAI403IgnoredByConfig(t *testing.T) {
+	repo := &rateLimitAccountRepoStub{}
+	counter := &openAI403CounterCacheStub{counts: []int64{1}}
+	blocker := &runtimeBlockRecorder{}
+	cfg := &config.Config{}
+	cfg.RateLimit.OpenAI403Ignore = true
+	service := NewRateLimitService(repo, nil, cfg, nil, nil)
+	service.SetOpenAI403CounterCache(counter)
+	service.SetAccountRuntimeBlocker(blocker)
+	account := &Account{
+		ID:       303,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+	}
+
+	shouldDisable := service.HandleUpstreamError(
+		context.Background(),
+		account,
+		http.StatusForbidden,
+		http.Header{},
+		[]byte(`{"error":{"message":"edge challenge"}}`),
+	)
+
+	require.False(t, shouldDisable)
+	require.Equal(t, 0, repo.setErrorCalls)
+	require.Equal(t, 0, repo.tempCalls)
+	require.Empty(t, blocker.accounts)
+	require.Len(t, counter.counts, 1, "counter must not be consumed when 403 is ignored")
+}
+
+// 配置 rate_limit.openai_403_disable_threshold=5：count=3 时（默认会永久禁用）仍只做临时
+// 不可调度，验证阈值可配置且未触发永久禁用。
+func TestRateLimitService_HandleUpstreamError_OpenAI403ConfigurableThreshold(t *testing.T) {
+	repo := &rateLimitAccountRepoStub{}
+	counter := &openAI403CounterCacheStub{counts: []int64{3}}
+	cfg := &config.Config{}
+	cfg.RateLimit.OpenAI403DisableThreshold = 5
+	service := NewRateLimitService(repo, nil, cfg, nil, nil)
+	service.SetOpenAI403CounterCache(counter)
+	account := &Account{
+		ID:       304,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+	}
+
+	shouldDisable := service.HandleUpstreamError(
+		context.Background(),
+		account,
+		http.StatusForbidden,
+		http.Header{},
+		[]byte(`{"error":{"message":"edge rejection again"}}`),
+	)
+
+	require.True(t, shouldDisable)
+	require.Equal(t, 0, repo.setErrorCalls, "must not permanently disable below configured threshold")
+	require.Equal(t, 1, repo.tempCalls)
+	require.Contains(t, repo.lastTempReason, "(3/5)")
+}

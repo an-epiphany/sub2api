@@ -1271,6 +1271,11 @@ type DefaultConfig struct {
 type RateLimitConfig struct {
 	OverloadCooldownMinutes int `mapstructure:"overload_cooldown_minutes"`  // 529过载冷却时间(分钟)
 	OAuth401CooldownMinutes int `mapstructure:"oauth_401_cooldown_minutes"` // OAuth 401临时不可调度冷却(分钟)
+	// OpenAI403Ignore 为 true 时完全忽略 OpenAI 403：不计数、不临时不可调度、不永久禁用，
+	// 账号保持可用，原始 403 透传给客户端。用于规避 Cloudflare 对浏览器型 UA 的质询 403 误伤账号。
+	OpenAI403Ignore bool `mapstructure:"openai_403_ignore"`
+	// OpenAI403DisableThreshold 连续 403 达到该次数才永久禁用账号；<=0 时回退到内置默认值(3)。
+	OpenAI403DisableThreshold int `mapstructure:"openai_403_disable_threshold"`
 }
 
 // APIKeyAuthCacheConfig API Key 认证缓存配置
@@ -1761,6 +1766,8 @@ func setDefaults() {
 	// RateLimit
 	viper.SetDefault("rate_limit.overload_cooldown_minutes", 10)
 	viper.SetDefault("rate_limit.oauth_401_cooldown_minutes", 10)
+	viper.SetDefault("rate_limit.openai_403_ignore", false)
+	viper.SetDefault("rate_limit.openai_403_disable_threshold", 3)
 
 	// Pricing - 从 model-price-repo 同步模型定价和上下文窗口数据（固定到 commit，避免分支漂移）
 	viper.SetDefault("pricing.remote_url", "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json")

@@ -819,6 +819,20 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		"account may be suspended or lack permissions",
 	)
 
+	// 配置开关：忽略 OpenAI 403。开启后不计数、不临时不可调度、不永久禁用，账号保持可用。
+	// 返回 false（不封锁、不触发 failover），原始 403 透传给客户端——用于规避 Cloudflare
+	// 对浏览器型 UA 的质询 403 误伤共享账号的场景。
+	if s.cfg != nil && s.cfg.RateLimit.OpenAI403Ignore {
+		slog.Warn("openai_403_ignored_by_config", "account_id", account.ID, "msg", truncateForLog([]byte(msg), 256))
+		return false
+	}
+
+	// 永久禁用阈值可配置；<=0 时回退到内置默认值。
+	disableThreshold := int64(openAI403DisableThreshold)
+	if s.cfg != nil && s.cfg.RateLimit.OpenAI403DisableThreshold > 0 {
+		disableThreshold = int64(s.cfg.RateLimit.OpenAI403DisableThreshold)
+	}
+
 	if s.openAI403CounterCache == nil {
 		s.handleAuthError(ctx, account, msg)
 		return true
@@ -831,14 +845,14 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		return true
 	}
 
-	if count >= openAI403DisableThreshold {
-		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, openAI403DisableThreshold)
+	if count >= disableThreshold {
+		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, disableThreshold)
 		s.handleAuthError(ctx, account, msg)
 		return true
 	}
 
 	until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
-	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, openAI403DisableThreshold, msg)
+	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, disableThreshold, msg)
 	s.notifyAccountSchedulingBlocked(account, until, "openai_403_temp")
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
 		slog.Warn("openai_403_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
@@ -851,7 +865,7 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		"account_id", account.ID,
 		"until", until,
 		"count", count,
-		"threshold", openAI403DisableThreshold,
+		"threshold", disableThreshold,
 	)
 	return true
 }

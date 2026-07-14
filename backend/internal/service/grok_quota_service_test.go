@@ -3,8 +3,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,14 +70,20 @@ type grokQuotaProxyRepo struct {
 
 type grokQuotaUsageLogRepo struct {
 	UsageLogRepository
-	stats *usagestats.AccountStats
-	err   error
-	calls int
+	stats      *usagestats.AccountStats
+	err        error
+	calls      int
+	startTimes []time.Time
 }
 
-func (r *grokQuotaUsageLogRepo) GetAccountWindowStats(context.Context, int64, time.Time) (*usagestats.AccountStats, error) {
+func (r *grokQuotaUsageLogRepo) GetAccountWindowStats(_ context.Context, _ int64, start time.Time) (*usagestats.AccountStats, error) {
 	r.calls++
+	r.startTimes = append(r.startTimes, start)
 	return r.stats, r.err
+}
+
+func (r *grokQuotaUsageLogRepo) GetAccountTodayStats(context.Context, int64) (*usagestats.AccountStats, error) {
+	return nil, nil
 }
 
 type grokHybridUpstream struct {
@@ -292,6 +300,54 @@ func TestGrokQuotaServiceProbeUsageReportsProbeModelOnUpstreamError(t *testing.T
 	require.Contains(t, infraerrors.Message(err), `probe model "grok-4.5"`)
 }
 
+func TestGrokQuotaServiceProbeUsageRedactsUpstreamErrorBodyFromErrorAndLogs(t *testing.T) {
+	const upstreamSecret = "upstream-secret-refresh-token"
+	account := &Account{
+		ID:          49,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "access-token",
+			"expires_at":   time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	repo := &grokQuotaAccountRepo{
+		mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+			accountsByID: map[int64]*Account{49: account},
+		},
+	}
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{},
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":"` + upstreamSecret + `","detail":"credential rejected"}`,
+		)),
+	}}
+	svc := NewGrokQuotaService(
+		repo,
+		nil,
+		NewGrokTokenProvider(repo, nil),
+		upstream,
+	)
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+
+	_, err := svc.ProbeUsage(context.Background(), account.ID)
+	require.Error(t, err)
+	require.Equal(t, "GROK_QUOTA_PROBE_UPSTREAM_ERROR", infraerrors.Reason(err))
+	require.Contains(t, infraerrors.Message(err), `probe model "grok-4.5"`)
+	require.NotContains(t, err.Error(), upstreamSecret)
+	require.NotContains(t, infraerrors.Message(err), upstreamSecret)
+	require.Contains(t, logs.String(), "GROK_QUOTA_PROBE_UPSTREAM_ERROR")
+	require.NotContains(t, logs.String(), upstreamSecret)
+	require.NotContains(t, logs.String(), "credential rejected")
+	require.Equal(t, xai.DefaultCLIBaseURL+"/responses", upstream.lastReq.URL.String())
+}
+
 func TestGrokQuotaServiceProbeUsageLoadsProxyWhenAccountEdgeMissing(t *testing.T) {
 	t.Parallel()
 
@@ -426,7 +482,8 @@ func TestGrokQuotaServiceQueryQuotaFreeFallsBackToGrok45(t *testing.T) {
 		accountsByID: map[int64]*Account{account.ID: account},
 	}}
 	upstream := &grokHybridUpstream{}
-	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+	usageRepo := &grokQuotaUsageLogRepo{stats: &usagestats.AccountStats{Tokens: 1_000_000}}
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, usageRepo)
 
 	result, err := svc.QueryQuota(context.Background(), account.ID)
 	require.NoError(t, err)
@@ -434,6 +491,10 @@ func TestGrokQuotaServiceQueryQuotaFreeFallsBackToGrok45(t *testing.T) {
 	require.Equal(t, "grok-4.5", result.Model)
 	require.NotNil(t, result.Billing)
 	require.Nil(t, result.Billing.UsagePercent)
+	require.NotNil(t, result.LocalUsage24h)
+	require.EqualValues(t, 1_000_000, result.LocalUsage24h.Tokens)
+	require.Equal(t, 1, usageRepo.calls)
+	require.WithinDuration(t, time.Now().UTC().Add(-24*time.Hour), usageRepo.startTimes[0], time.Second)
 	require.NotNil(t, result.Snapshot)
 	require.NotNil(t, result.Snapshot.Tokens)
 	require.EqualValues(t, 2_000_000, *result.Snapshot.Tokens.Limit)
@@ -469,7 +530,8 @@ func TestGrokQuotaServiceQueryQuotaPaidBillingSkipsActiveProbe(t *testing.T) {
 	}}
 	usagePercent := 25.0
 	upstream := &grokHybridUpstream{weeklyUsagePercent: &usagePercent}
-	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+	usageRepo := &grokQuotaUsageLogRepo{stats: &usagestats.AccountStats{Tokens: 1_000_000}}
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, usageRepo)
 
 	result, err := svc.QueryQuota(context.Background(), account.ID)
 	require.NoError(t, err)
@@ -478,6 +540,7 @@ func TestGrokQuotaServiceQueryQuotaPaidBillingSkipsActiveProbe(t *testing.T) {
 	require.InDelta(t, usagePercent, *result.Billing.UsagePercent, 1e-9)
 	require.Nil(t, result.Snapshot)
 	require.Empty(t, result.Model)
+	require.Nil(t, result.LocalUsage24h)
 
 	requests, _ := upstream.snapshot()
 	require.Len(t, requests, 2)
@@ -515,6 +578,78 @@ func TestGrokQuotaServiceQueryQuotaCustomPaidMonthlyLimitSkipsActiveProbe(t *tes
 	for _, req := range requests {
 		require.Equal(t, "/v1/billing", req.URL.Path)
 	}
+}
+
+func TestGrokLocalUsage24hUsesRollingUTCWindow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 14, 20, 30, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+
+	t.Run("returns usage from exact rolling window", func(t *testing.T) {
+		repo := &grokQuotaUsageLogRepo{stats: &usagestats.AccountStats{Tokens: 1_250_000}}
+		stats := grokLocalUsage24h(context.Background(), repo, 57, now)
+
+		require.NotNil(t, stats)
+		require.EqualValues(t, 1_250_000, stats.Tokens)
+		require.Equal(t, []time.Time{now.UTC().Add(-24 * time.Hour)}, repo.startTimes)
+	})
+
+	t.Run("query failure returns no stats", func(t *testing.T) {
+		repo := &grokQuotaUsageLogRepo{err: context.DeadlineExceeded}
+		stats := grokLocalUsage24h(context.Background(), repo, 57, now)
+
+		require.Nil(t, stats)
+		require.Equal(t, []time.Time{now.UTC().Add(-24 * time.Hour)}, repo.startTimes)
+	})
+
+	t.Run("missing repository returns no stats", func(t *testing.T) {
+		require.Nil(t, grokLocalUsage24h(context.Background(), nil, 57, now))
+	})
+
+	t.Run("invalid account returns no stats without query", func(t *testing.T) {
+		repo := &grokQuotaUsageLogRepo{}
+		require.Nil(t, grokLocalUsage24h(context.Background(), repo, 0, now))
+		require.Zero(t, repo.calls)
+	})
+}
+
+func TestGrokLocalUsageForQuotaSelectsFreeOrPaidWindows(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	billing := &xai.BillingSummary{
+		PeriodType:         "weekly",
+		PeriodStart:        now.Add(-4 * 24 * time.Hour).Format(time.RFC3339),
+		PeriodEnd:          now.Add(3 * 24 * time.Hour).Format(time.RFC3339),
+		BillingPeriodStart: now.Add(-13 * 24 * time.Hour).Format(time.RFC3339),
+		BillingPeriodEnd:   now.Add(17 * 24 * time.Hour).Format(time.RFC3339),
+	}
+
+	t.Run("free queries only rolling 24h", func(t *testing.T) {
+		repo := &grokQuotaUsageLogRepo{stats: &usagestats.AccountStats{Tokens: 500_000}}
+		rolling, weekly, monthly := grokLocalUsageForQuota(context.Background(), repo, 57, billing, now)
+
+		require.NotNil(t, rolling)
+		require.Nil(t, weekly)
+		require.Nil(t, monthly)
+		require.Equal(t, []time.Time{now.Add(-24 * time.Hour)}, repo.startTimes)
+	})
+
+	t.Run("paid queries only billing windows", func(t *testing.T) {
+		usagePercent := 25.0
+		paidBilling := *billing
+		paidBilling.UsagePercent = &usagePercent
+		repo := &grokQuotaUsageLogRepo{stats: &usagestats.AccountStats{Tokens: 500_000}}
+		rolling, weekly, monthly := grokLocalUsageForQuota(context.Background(), repo, 57, &paidBilling, now)
+
+		require.Nil(t, rolling)
+		require.NotNil(t, weekly)
+		require.NotNil(t, monthly)
+		require.Equal(t, []time.Time{
+			now.Add(-4 * 24 * time.Hour),
+			now.Add(-13 * 24 * time.Hour),
+		}, repo.startTimes)
+	})
 }
 
 func TestGrokLocalUsageForBillingOnlyReturnsAvailableWindows(t *testing.T) {
@@ -567,10 +702,12 @@ func TestAccountUsageServiceGrokRefreshUsesBillingOnly(t *testing.T) {
 		accountsByID: map[int64]*Account{account.ID: account},
 	}}
 	upstream := &grokHybridUpstream{}
-	quotaService := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+	usageRepo := &grokQuotaUsageLogRepo{stats: &usagestats.AccountStats{Tokens: 750_000}}
+	quotaService := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, usageRepo)
 	usageService := &AccountUsageService{
 		grokQuotaFetcher: NewGrokQuotaFetcher(),
 		grokQuotaService: quotaService,
+		usageLogRepo:     usageRepo,
 		cache:            NewUsageCache(),
 	}
 
@@ -578,6 +715,11 @@ func TestAccountUsageServiceGrokRefreshUsesBillingOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, usage.GrokBilling)
 	require.Nil(t, usage.GrokBilling.UsagePercent)
+	require.NotNil(t, usage.GrokLocalUsage24h)
+	require.EqualValues(t, 750_000, usage.GrokLocalUsage24h.Tokens)
+	require.Equal(t, 1, usageRepo.calls)
+	require.Len(t, usageRepo.startTimes, 1)
+	require.WithinDuration(t, time.Now().UTC().Add(-24*time.Hour), usageRepo.startTimes[0], time.Second)
 
 	requests, _ := upstream.snapshot()
 	require.Len(t, requests, 2)

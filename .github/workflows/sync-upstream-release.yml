@@ -132,7 +132,11 @@ jobs:
               -f event=workflow_dispatch \
               -f per_page=50 \
               --jq ".workflow_runs
-                | map(select(.head_sha == \"${PREPARED_CUSTOM_SHA}\" and .created_at >= \"${dispatch_time}\"))
+                | map(select(
+                    .head_sha == \"${PREPARED_CUSTOM_SHA}\"
+                    and .head_branch == \"${CANDIDATE_BRANCH}\"
+                    and .created_at >= \"${dispatch_time}\"
+                  ))
                 | sort_by(.created_at)
                 | last
                 | .id // empty")
@@ -159,9 +163,10 @@ jobs:
           upstream_tag="v${UPSTREAM_VERSION}"
           release_json=$(mktemp)
 
+          printf 'Sync upstream %s\n\n' "$upstream_tag" >"$message_file"
           printf 'Synced from [%s %s](https://github.com/%s/releases/tag/%s).\n\n' \
             "$UPSTREAM_REPOSITORY" "$upstream_tag" "$UPSTREAM_REPOSITORY" "$upstream_tag" \
-            >"$message_file"
+            >>"$message_file"
 
           if gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${upstream_tag}" \
               >"$release_json" 2>/dev/null \

@@ -169,9 +169,10 @@ run_publish() {
 
 setup_publication_fixture() {
   local name=$1
+  local mode=${2:-normal}
   local output="$TMP_ROOT/$name-prepare-output"
 
-  create_fixture "$name" normal
+  create_fixture "$name" "$mode"
   run_prepare "$FIXTURE_RUNNER" 0.1.163 automation/upstream-sync-test >"$output"
 
   PUBLICATION_FIXTURE=$(dirname "$FIXTURE_RUNNER")
@@ -322,6 +323,45 @@ test_main_lease_rejects_publication() {
   assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
 }
 
+test_main_race_rejects_publication_at_push() {
+  local wrapper_dir="$TMP_ROOT/git-wrapper"
+  local real_git
+  local rewound_main
+
+  setup_publication_fixture publish-main-push-race merge-version
+  real_git=$(command -v git)
+  rewound_main=$(git -C "$FIXTURE_RUNNER" rev-parse "${PUBLICATION_ORIGIN_MAIN}^")
+  mkdir -p "$wrapper_dir"
+  cat >"$wrapper_dir/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *' --atomic '* ]]; then
+  "$REAL_GIT" --git-dir="$RACE_ORIGIN" update-ref refs/heads/main "$RACE_MAIN_SHA"
+fi
+exec "$REAL_GIT" "$@"
+EOF
+  chmod +x "$wrapper_dir/git"
+
+  export REAL_GIT="$real_git"
+  export RACE_ORIGIN="$PUBLICATION_FIXTURE/origin.git"
+  export RACE_MAIN_SHA="$rewound_main"
+  assert_fails env PATH="$wrapper_dir:$PATH" bash -c \
+    'cd "$1" && shift && "$@"' _ "$FIXTURE_RUNNER" \
+    "$SCRIPT" publish \
+    "$PUBLICATION_ORIGIN_MAIN" \
+    "$PUBLICATION_ORIGIN_CUSTOM" \
+    "$PUBLICATION_PREPARED_MAIN" \
+    "$PUBLICATION_PREPARED_CUSTOM" \
+    "$PUBLICATION_CANDIDATE" \
+    "$PUBLICATION_TAG" \
+    "$PUBLICATION_MESSAGE"
+  unset REAL_GIT RACE_ORIGIN RACE_MAIN_SHA
+
+  assert_eq "$rewound_main" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
+  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
+}
+
 test_candidate_mismatch_rejects_publication() {
   setup_publication_fixture publish-candidate-race
   git -C "$FIXTURE_RUNNER" push -q --force origin \
@@ -352,6 +392,20 @@ test_workflow_entry_points() {
   rg -q '^  workflow_dispatch:' "$ROOT/.github/workflows/backend-ci.yml"
   rg -Fq 'run-name: Release ${{ github.event.inputs.tag || github.ref_name }}' \
     "$ROOT/.github/workflows/release.yml"
+  rg -q "od -An -N16 -tx1 /dev/urandom" "$ROOT/.github/workflows/release.yml"
+  rg -q 'grep -Fqx "\$delimiter" "\$tag_message_file"' \
+    "$ROOT/.github/workflows/release.yml"
+  if rg -q 'message<<EOF' "$ROOT/.github/workflows/release.yml"; then
+    printf 'Release workflow uses a fixed multiline-output delimiter\n' >&2
+    return 1
+  fi
+  rg -Fq 'TAG_MESSAGE: ${{ steps.tag_message.outputs.message }}' \
+    "$ROOT/.github/workflows/release.yml"
+  if rg -Fq "TAG_MESSAGE='\${{ steps.tag_message.outputs.message }}'" \
+      "$ROOT/.github/workflows/release.yml"; then
+    printf 'Release workflow interpolates tag message into shell source\n' >&2
+    return 1
+  fi
 }
 
 test_orchestration_contract() {
@@ -364,10 +418,12 @@ test_orchestration_contract() {
   rg -q '^  actions: write' "$workflow"
   rg -q '^  contents: write' "$workflow"
   rg -q 'backend-ci\.yml' "$workflow"
+  rg -q 'head_branch.*CANDIDATE_BRANCH' "$workflow"
   rg -q 'release\.yml' "$workflow"
   rg -q 'simple_release=true' "$workflow"
   rg -q 'gh run watch' "$workflow"
   rg -q 'gh release view' "$workflow"
+  rg -Fq "printf 'Sync upstream %s\\n\\n'" "$workflow"
   rg -q 'if: always\(\)' "$workflow"
   if rg -q '(^|[^A-Z_])PAT([^A-Z_]|$)' "$workflow"; then
     printf 'workflow must not depend on a PAT\n' >&2
@@ -382,6 +438,7 @@ test_rebase_version_conflict
 test_source_conflict_fails
 test_atomic_publication
 test_main_lease_rejects_publication
+test_main_race_rejects_publication_at_push
 test_candidate_mismatch_rejects_publication
 test_candidate_cleanup_scope
 test_workflow_entry_points

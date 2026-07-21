@@ -148,26 +148,33 @@ jobs:
 
       - name: Get tag message
         id: tag_message
+        env:
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG_NAME=${{ github.event.inputs.tag }}
-          else
-            TAG_NAME=${GITHUB_REF#refs/tags/}
-          fi
+          set -euo pipefail
           echo "Processing tag: $TAG_NAME"
 
           # 获取完整的 tag message（跳过第一行标题）
-          TAG_MESSAGE=$(git tag -l --format='%(contents:body)' "$TAG_NAME")
+          tag_message_file=$(mktemp)
+          git tag -l --format='%(contents:body)' "$TAG_NAME" >"$tag_message_file"
 
           # 调试输出
-          echo "Tag message length: ${#TAG_MESSAGE}"
+          echo "Tag message length: $(wc -c <"$tag_message_file" | tr -d ' ')"
           echo "Tag message preview:"
-          echo "$TAG_MESSAGE" | head -10
+          head -10 "$tag_message_file"
 
-          # 使用 EOF 分隔符处理多行内容
-          echo "message<<EOF" >> $GITHUB_OUTPUT
-          echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          while :; do
+            delimiter="gha_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            grep -Fqx "$delimiter" "$tag_message_file" || break
+          done
+          {
+            printf 'message<<%s\n' "$delimiter"
+            cat "$tag_message_file"
+            if [[ -s $tag_message_file && -n $(tail -c 1 "$tag_message_file") ]]; then
+              printf '\n'
+            fi
+            printf '%s\n' "$delimiter"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Set lowercase owner for GHCR
         id: lowercase
@@ -206,6 +213,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG_MESSAGE: ${{ steps.tag_message.outputs.message }}
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
         continue-on-error: true
         run: |
           # 检查必要的环境变量
@@ -214,18 +223,12 @@ jobs:
             exit 0
           fi
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG_NAME=${{ github.event.inputs.tag }}
-          else
-            TAG_NAME=${GITHUB_REF#refs/tags/}
-          fi
           VERSION=${TAG_NAME#v}
           REPO="${{ github.repository }}"
           GHCR_IMAGE="ghcr.io/${REPO,,}"  # ${,,} converts to lowercase
 
           # 获取 tag message 内容并转义 Markdown 特殊字符
-          TAG_MESSAGE='${{ steps.tag_message.outputs.message }}'
-          TAG_MESSAGE=$(echo "$TAG_MESSAGE" | sed 's/\([_*`\[]\)/\\\1/g')
+          TAG_MESSAGE=$(printf '%s' "$TAG_MESSAGE" | sed 's/\([_*`\[]\)/\\\1/g')
 
           # 限制消息长度（Telegram 消息限制 4096 字符，预留空间给头尾固定内容）
           if [ ${#TAG_MESSAGE} -gt 3500 ]; then

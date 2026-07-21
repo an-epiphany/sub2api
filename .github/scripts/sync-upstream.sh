@@ -234,6 +234,8 @@ publish() {
   [[ -f $tag_message_file ]] || die "tag message file does not exist: $tag_message_file"
   git cat-file -e "$prepared_main^{commit}"
   git cat-file -e "$prepared_custom^{commit}"
+  git merge-base --is-ancestor "$expected_main" "$prepared_main" \
+    || die 'prepared main is not a fast-forward of the recorded main'
 
   actual_main=$(remote_head_sha "$MAIN_BRANCH")
   actual_custom=$(remote_head_sha "$CUSTOM_BRANCH")
@@ -247,6 +249,7 @@ publish() {
 
   git tag -a "$target_tag" "$prepared_custom" -F "$tag_message_file"
   git push --atomic \
+    --force-with-lease="refs/heads/${MAIN_BRANCH}:${expected_main}" \
     --force-with-lease="refs/heads/${CUSTOM_BRANCH}:${expected_custom}" \
     origin \
     "${prepared_main}:refs/heads/${MAIN_BRANCH}" \

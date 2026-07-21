@@ -501,6 +501,10 @@ test_orchestration_contract() {
   rg -Fq '.github/scripts/sync-upstream.sh render-custom-notes \' "$workflow"
   rg -Fq '.github/custom-release-notes.md >>"$message_file"' "$workflow"
   rg -Fq "printf '\\n\\n## 上游更新\\n\\n'" "$workflow"
+  if rg -Fq "printf '## Upstream changes" "$workflow"; then
+    printf 'workflow writes a duplicate upstream changes heading\n' >&2
+    return 1
+  fi
   rg -Fq '.github/scripts/sync-upstream.sh validate-release-notes \' "$workflow"
   rg -q 'if: always\(\)' "$workflow"
   if rg -q '(^|[^A-Z_])PAT([^A-Z_]|$)' "$workflow"; then

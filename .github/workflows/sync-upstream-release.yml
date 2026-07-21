@@ -175,7 +175,6 @@ jobs:
               && [[ -n $(jq -r '.body // empty' "$release_json") ]]; then
             jq -r '.body' "$release_json" >>"$message_file"
           else
-            printf '## Upstream changes\n\n' >>"$message_file"
             if [[ -n $LATEST_VERSION ]] \
                 && git rev-parse --verify --quiet "refs/tags/v${LATEST_VERSION}^{commit}" >/dev/null; then
               git log --format='- %s' -n 100 \

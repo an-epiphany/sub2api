@@ -110,6 +110,33 @@ render_custom_notes() {
   cat "$notes_file"
 }
 
+validate_release_notes() {
+  local target_tag=$1
+  local upstream_repository=$2
+  local upstream_version=$3
+  local body
+  local expected_intro
+
+  validate_version "$upstream_version"
+  [[ $upstream_repository =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || die "invalid upstream repository: $upstream_repository"
+  [[ $target_tag == "v${upstream_version}-${CUSTOM_SUFFIX}" ]] \
+    || die "release tag does not match upstream version: $target_tag"
+  git cat-file -e "refs/tags/${target_tag}^{tag}" 2>/dev/null \
+    || die "annotated release tag does not exist: $target_tag"
+
+  body=$(git tag -l --format='%(contents:body)' "$target_tag")
+  expected_intro=$(printf \
+    '基于上游 [v%s](https://github.com/%s/releases/tag/v%s) 同步，包含以下自定义功能。' \
+    "$upstream_version" "$upstream_repository" "$upstream_version")
+  [[ $body == "$expected_intro"$'\n'* ]] \
+    || die 'release notes do not start with the expected upstream version'
+  grep -Fqx '## 自定义功能' <<<"$body" \
+    || die 'release notes do not contain the custom features section'
+  grep -Fqx '## 上游更新' <<<"$body" \
+    || die 'release notes do not contain the upstream changes section'
+}
+
 only_version_conflicted() {
   local conflicts
 
@@ -303,6 +330,10 @@ case "$command" in
   render-custom-notes)
     [[ $# == 3 ]] || die 'usage: render-custom-notes UPSTREAM_REPOSITORY UPSTREAM_VERSION NOTES_FILE'
     render_custom_notes "$@"
+    ;;
+  validate-release-notes)
+    [[ $# == 3 ]] || die 'usage: validate-release-notes TARGET_TAG UPSTREAM_REPOSITORY UPSTREAM_VERSION'
+    validate_release_notes "$@"
     ;;
   prepare)
     [[ $# == 2 ]] || die 'usage: prepare UPSTREAM_VERSION CANDIDATE_BRANCH'

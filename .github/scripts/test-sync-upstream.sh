@@ -306,6 +306,7 @@ test_atomic_publication() {
 }
 
 test_tag_release_notes_round_trip() {
+  local incomplete_message
   local expected
   local actual
 
@@ -331,6 +332,20 @@ test_tag_release_notes_round_trip() {
     tag -l --format='%(contents:body)' "$PUBLICATION_TAG")
 
   assert_eq "$expected" "$actual"
+  (cd "$FIXTURE_RUNNER" && "$SCRIPT" validate-release-notes \
+    "$PUBLICATION_TAG" Wei-Shaw/sub2api 0.1.163)
+
+  incomplete_message="$PUBLICATION_FIXTURE/incomplete-tag-message.md"
+  printf '%s\n' \
+    'Sync upstream v0.1.164' \
+    '' \
+    '基于上游 [v0.1.164](https://github.com/Wei-Shaw/sub2api/releases/tag/v0.1.164) 同步，包含以下自定义功能。' \
+    >"$incomplete_message"
+  git -C "$FIXTURE_RUNNER" tag --cleanup=verbatim -a \
+    v0.1.164-custom1 -F "$incomplete_message"
+  assert_fails bash -c 'cd "$1" && "$2" validate-release-notes "$3" "$4" "$5"' \
+    _ "$FIXTURE_RUNNER" "$SCRIPT" \
+    v0.1.164-custom1 Wei-Shaw/sub2api 0.1.164
 }
 
 test_main_lease_rejects_publication() {
@@ -486,6 +501,7 @@ test_orchestration_contract() {
   rg -Fq '.github/scripts/sync-upstream.sh render-custom-notes \' "$workflow"
   rg -Fq '.github/custom-release-notes.md >>"$message_file"' "$workflow"
   rg -Fq "printf '\\n\\n## 上游更新\\n\\n'" "$workflow"
+  rg -Fq '.github/scripts/sync-upstream.sh validate-release-notes \' "$workflow"
   rg -q 'if: always\(\)' "$workflow"
   if rg -q '(^|[^A-Z_])PAT([^A-Z_]|$)' "$workflow"; then
     printf 'workflow must not depend on a PAT\n' >&2

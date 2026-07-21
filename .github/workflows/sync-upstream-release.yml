@@ -218,9 +218,12 @@ jobs:
         if: steps.inspect.outputs.decision != 'noop'
         env:
           TARGET_TAG: ${{ steps.inspect.outputs.target_tag }}
+          UPSTREAM_VERSION: ${{ steps.inspect.outputs.upstream_version }}
         run: |
           set -euo pipefail
           git fetch --force origin "refs/tags/${TARGET_TAG}:refs/tags/${TARGET_TAG}"
+          .github/scripts/sync-upstream.sh validate-release-notes \
+            "$TARGET_TAG" "$UPSTREAM_REPOSITORY" "$UPSTREAM_VERSION"
           target_sha=$(git rev-list -n 1 "$TARGET_TAG")
           dispatch_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           expected_title="Release ${TARGET_TAG}"

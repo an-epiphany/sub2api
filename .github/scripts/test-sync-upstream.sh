@@ -409,6 +409,16 @@ test_custom_release_notes_rejects_missing_or_empty_file() {
   assert_fails "$SCRIPT" render-custom-notes Wei-Shaw/sub2api 0.1.163 "$empty"
 }
 
+test_custom_release_notes_source() {
+  local notes="$ROOT/.github/custom-release-notes.md"
+
+  [[ -f $notes ]]
+  grep -q '[^[:space:]]' "$notes"
+  rg -q '^## 自定义功能$' "$notes"
+  rg -q '`rate_limit\.openai_403_ignore`' "$notes"
+  rg -q '`rate_limit\.openai_403_disable_threshold`' "$notes"
+}
+
 test_workflow_entry_points() {
   rg -q '^  workflow_dispatch:' "$ROOT/.github/workflows/backend-ci.yml"
   rg -Fq 'run-name: Release ${{ github.event.inputs.tag || github.ref_name }}' \
@@ -464,6 +474,7 @@ test_candidate_mismatch_rejects_publication
 test_candidate_cleanup_scope
 test_custom_release_notes
 test_custom_release_notes_rejects_missing_or_empty_file
+test_custom_release_notes_source
 test_workflow_entry_points
 test_orchestration_contract
 printf 'all sync-upstream tests passed\n'

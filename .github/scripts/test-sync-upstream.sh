@@ -454,7 +454,9 @@ test_orchestration_contract() {
   rg -q 'simple_release=true' "$workflow"
   rg -q 'gh run watch' "$workflow"
   rg -q 'gh release view' "$workflow"
-  rg -Fq "printf 'Sync upstream %s\\n\\n'" "$workflow"
+  rg -Fq '.github/scripts/sync-upstream.sh render-custom-notes \' "$workflow"
+  rg -Fq '.github/custom-release-notes.md >"$message_file"' "$workflow"
+  rg -Fq "printf '\\n\\n## 上游更新\\n\\n'" "$workflow"
   rg -q 'if: always\(\)' "$workflow"
   if rg -q '(^|[^A-Z_])PAT([^A-Z_]|$)' "$workflow"; then
     printf 'workflow must not depend on a PAT\n' >&2

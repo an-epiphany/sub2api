@@ -163,10 +163,10 @@ jobs:
           upstream_tag="v${UPSTREAM_VERSION}"
           release_json=$(mktemp)
 
-          printf 'Sync upstream %s\n\n' "$upstream_tag" >"$message_file"
-          printf 'Synced from [%s %s](https://github.com/%s/releases/tag/%s).\n\n' \
-            "$UPSTREAM_REPOSITORY" "$upstream_tag" "$UPSTREAM_REPOSITORY" "$upstream_tag" \
-            >>"$message_file"
+          .github/scripts/sync-upstream.sh render-custom-notes \
+            "$UPSTREAM_REPOSITORY" "$UPSTREAM_VERSION" \
+            .github/custom-release-notes.md >"$message_file"
+          printf '\n\n## 上游更新\n\n' >>"$message_file"
 
           if gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${upstream_tag}" \
               >"$release_json" 2>/dev/null \

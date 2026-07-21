@@ -196,6 +196,78 @@ prepare() {
   printf 'target_tag=v%s\n' "$target_version"
 }
 
+validate_sha() {
+  [[ ${1:-} =~ ^[0-9a-f]{40,64}$ ]] || die "invalid Git SHA: ${1:-<empty>}"
+}
+
+remote_head_sha() {
+  local branch=$1
+
+  git ls-remote --heads origin "refs/heads/$branch" | awk 'NR == 1 { print $1 }'
+}
+
+remote_tag_exists() {
+  local tag=$1
+
+  [[ -n $(git ls-remote --tags origin "refs/tags/$tag") ]]
+}
+
+publish() {
+  local expected_main=$1
+  local expected_custom=$2
+  local prepared_main=$3
+  local prepared_custom=$4
+  local candidate_branch=$5
+  local target_tag=$6
+  local tag_message_file=$7
+  local actual_main
+  local actual_custom
+  local actual_candidate
+
+  validate_sha "$expected_main"
+  validate_sha "$expected_custom"
+  validate_sha "$prepared_main"
+  validate_sha "$prepared_custom"
+  [[ $candidate_branch == "$CANDIDATE_PREFIX"* ]] || die "invalid candidate branch: $candidate_branch"
+  git check-ref-format --branch "$candidate_branch" >/dev/null || die "invalid candidate branch: $candidate_branch"
+  [[ $target_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+-custom1$ ]] || die "invalid target tag: $target_tag"
+  [[ -f $tag_message_file ]] || die "tag message file does not exist: $tag_message_file"
+  git cat-file -e "$prepared_main^{commit}"
+  git cat-file -e "$prepared_custom^{commit}"
+
+  actual_main=$(remote_head_sha "$MAIN_BRANCH")
+  actual_custom=$(remote_head_sha "$CUSTOM_BRANCH")
+  actual_candidate=$(remote_head_sha "$candidate_branch")
+
+  [[ $actual_main == "$expected_main" ]] || die 'origin main changed after candidate preparation'
+  [[ $actual_custom == "$expected_custom" ]] || die 'origin custom branch changed after candidate preparation'
+  [[ $actual_candidate == "$prepared_custom" ]] || die 'candidate ref does not match the tested custom SHA'
+  ! remote_tag_exists "$target_tag" || die "target tag already exists: $target_tag"
+  ! git show-ref --verify --quiet "refs/tags/$target_tag" || die "local target tag already exists: $target_tag"
+
+  git tag -a "$target_tag" "$prepared_custom" -F "$tag_message_file"
+  git push --atomic \
+    --force-with-lease="refs/heads/${CUSTOM_BRANCH}:${expected_custom}" \
+    origin \
+    "${prepared_main}:refs/heads/${MAIN_BRANCH}" \
+    "${prepared_custom}:refs/heads/${CUSTOM_BRANCH}" \
+    "refs/tags/${target_tag}:refs/tags/${target_tag}" >&2
+}
+
+cleanup_candidates() {
+  local ref
+  local branch
+  local status=0
+
+  while read -r _ ref; do
+    [[ -n ${ref:-} ]] || continue
+    branch=${ref#refs/heads/}
+    git push origin --delete "$branch" >&2 || status=1
+  done < <(git ls-remote --heads origin "refs/heads/${CANDIDATE_PREFIX}*")
+
+  return "$status"
+}
+
 command=${1:-}
 shift || true
 
@@ -211,6 +283,14 @@ case "$command" in
   prepare)
     [[ $# == 2 ]] || die 'usage: prepare UPSTREAM_VERSION CANDIDATE_BRANCH'
     prepare "$@"
+    ;;
+  publish)
+    [[ $# == 7 ]] || die 'usage: publish EXPECTED_MAIN EXPECTED_CUSTOM PREPARED_MAIN PREPARED_CUSTOM CANDIDATE_BRANCH TARGET_TAG TAG_MESSAGE_FILE'
+    publish "$@"
+    ;;
+  cleanup-candidates)
+    [[ $# == 0 ]] || die 'cleanup-candidates takes no arguments'
+    cleanup_candidates
     ;;
   *)
     die "unknown command: ${command:-<empty>}"

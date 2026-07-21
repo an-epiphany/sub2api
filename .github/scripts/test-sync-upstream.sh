@@ -160,6 +160,62 @@ run_prepare() {
   (cd "$repo" && "$SCRIPT" prepare "$@")
 }
 
+run_publish() {
+  local repo=$1
+  shift
+
+  (cd "$repo" && "$SCRIPT" publish "$@")
+}
+
+setup_publication_fixture() {
+  local name=$1
+  local output="$TMP_ROOT/$name-prepare-output"
+
+  create_fixture "$name" normal
+  run_prepare "$FIXTURE_RUNNER" 0.1.163 automation/upstream-sync-test >"$output"
+
+  PUBLICATION_FIXTURE=$(dirname "$FIXTURE_RUNNER")
+  PUBLICATION_ORIGIN_MAIN=$(value_for origin_main_sha "$output")
+  PUBLICATION_ORIGIN_CUSTOM=$(value_for origin_custom_sha "$output")
+  PUBLICATION_PREPARED_MAIN=$(value_for prepared_main_sha "$output")
+  PUBLICATION_PREPARED_CUSTOM=$(value_for prepared_custom_sha "$output")
+  PUBLICATION_CANDIDATE=$(value_for candidate_branch "$output")
+  PUBLICATION_TAG=$(value_for target_tag "$output")
+  PUBLICATION_MESSAGE="$PUBLICATION_FIXTURE/tag-message.md"
+  printf 'Automated test release\n' >"$PUBLICATION_MESSAGE"
+
+  git -C "$FIXTURE_RUNNER" push -q origin \
+    "$PUBLICATION_PREPARED_CUSTOM:refs/heads/$PUBLICATION_CANDIDATE"
+}
+
+publish_fixture() {
+  run_publish "$FIXTURE_RUNNER" \
+    "$PUBLICATION_ORIGIN_MAIN" \
+    "$PUBLICATION_ORIGIN_CUSTOM" \
+    "$PUBLICATION_PREPARED_MAIN" \
+    "$PUBLICATION_PREPARED_CUSTOM" \
+    "$PUBLICATION_CANDIDATE" \
+    "$PUBLICATION_TAG" \
+    "$PUBLICATION_MESSAGE"
+}
+
+bare_ref() {
+  local fixture=$1
+  local ref=$2
+
+  git --git-dir="$fixture/origin.git" rev-parse --verify "$ref"
+}
+
+assert_missing_bare_ref() {
+  local fixture=$1
+  local ref=$2
+
+  if git --git-dir="$fixture/origin.git" rev-parse --verify --quiet "$ref" >/dev/null; then
+    printf 'expected remote ref to be absent: %s\n' "$ref" >&2
+    return 1
+  fi
+}
+
 test_version_state() {
   local latest
 
@@ -235,9 +291,70 @@ test_source_conflict_fails() {
   assert_fails run_prepare "$FIXTURE_RUNNER" 0.1.163 automation/upstream-sync-test
 }
 
+test_atomic_publication() {
+  local tag_target
+
+  setup_publication_fixture publish-success
+  publish_fixture
+
+  assert_eq "$PUBLICATION_PREPARED_MAIN" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
+  assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_eq tag "$(git --git-dir="$PUBLICATION_FIXTURE/origin.git" cat-file -t "refs/tags/$PUBLICATION_TAG")"
+  tag_target=$(git --git-dir="$PUBLICATION_FIXTURE/origin.git" rev-parse "refs/tags/$PUBLICATION_TAG^{}")
+  assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$tag_target"
+}
+
+test_main_lease_rejects_publication() {
+  local concurrent="$TMP_ROOT/concurrent-main"
+  local concurrent_sha
+
+  setup_publication_fixture publish-main-race
+  git clone -q --branch main "$PUBLICATION_FIXTURE/origin.git" "$concurrent"
+  configure_git "$concurrent"
+  printf 'concurrent update\n' >"$concurrent/concurrent.txt"
+  commit_all "$concurrent" 'concurrent main update'
+  git -C "$concurrent" push -q origin main
+  concurrent_sha=$(git -C "$concurrent" rev-parse HEAD)
+
+  assert_fails publish_fixture
+  assert_eq "$concurrent_sha" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
+  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
+}
+
+test_candidate_mismatch_rejects_publication() {
+  setup_publication_fixture publish-candidate-race
+  git -C "$FIXTURE_RUNNER" push -q --force origin \
+    "$PUBLICATION_ORIGIN_CUSTOM:refs/heads/$PUBLICATION_CANDIDATE"
+
+  assert_fails publish_fixture
+  assert_eq "$PUBLICATION_ORIGIN_MAIN" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
+  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
+}
+
+test_candidate_cleanup_scope() {
+  local keep_branch=manual-keep
+
+  setup_publication_fixture cleanup
+  git -C "$FIXTURE_RUNNER" push -q origin \
+    "$PUBLICATION_PREPARED_CUSTOM:refs/heads/automation/upstream-sync-stale" \
+    "$PUBLICATION_PREPARED_CUSTOM:refs/heads/$keep_branch"
+
+  (cd "$FIXTURE_RUNNER" && "$SCRIPT" cleanup-candidates)
+
+  assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/heads/$PUBLICATION_CANDIDATE"
+  assert_missing_bare_ref "$PUBLICATION_FIXTURE" refs/heads/automation/upstream-sync-stale
+  assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" "refs/heads/$keep_branch")"
+}
+
 test_version_state
 test_normal_preparation
 test_merge_version_conflict
 test_rebase_version_conflict
 test_source_conflict_fails
+test_atomic_publication
+test_main_lease_rejects_publication
+test_candidate_mismatch_rejects_publication
+test_candidate_cleanup_scope
 printf 'all sync-upstream tests passed\n'

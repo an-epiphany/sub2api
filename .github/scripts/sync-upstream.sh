@@ -264,7 +264,7 @@ publish() {
   ! remote_tag_exists "$target_tag" || die "target tag already exists: $target_tag"
   ! git show-ref --verify --quiet "refs/tags/$target_tag" || die "local target tag already exists: $target_tag"
 
-  git tag -a "$target_tag" "$prepared_custom" -F "$tag_message_file"
+  git tag --cleanup=verbatim -a "$target_tag" "$prepared_custom" -F "$tag_message_file"
   git push --atomic \
     --force-with-lease="refs/heads/${MAIN_BRANCH}:${expected_main}" \
     --force-with-lease="refs/heads/${CUSTOM_BRANCH}:${expected_custom}" \

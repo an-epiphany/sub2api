@@ -305,6 +305,34 @@ test_atomic_publication() {
   assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$tag_target"
 }
 
+test_tag_release_notes_round_trip() {
+  local expected
+  local actual
+
+  setup_publication_fixture publish-release-notes
+  printf '%s\n' \
+    'Sync upstream v0.1.163' \
+    '' \
+    '基于上游 [v0.1.163](https://github.com/Wei-Shaw/sub2api/releases/tag/v0.1.163) 同步，包含以下自定义功能。' \
+    '' \
+    '## 自定义功能' \
+    '' \
+    '- 功能 A' \
+    '' \
+    '## 上游更新' \
+    '' \
+    '### 修复' \
+    '' \
+    '- 上游修复 A' >"$PUBLICATION_MESSAGE"
+  publish_fixture
+
+  expected=$'基于上游 [v0.1.163](https://github.com/Wei-Shaw/sub2api/releases/tag/v0.1.163) 同步，包含以下自定义功能。\n\n## 自定义功能\n\n- 功能 A\n\n## 上游更新\n\n### 修复\n\n- 上游修复 A'
+  actual=$(git --git-dir="$PUBLICATION_FIXTURE/origin.git" \
+    tag -l --format='%(contents:body)' "$PUBLICATION_TAG")
+
+  assert_eq "$expected" "$actual"
+}
+
 test_main_lease_rejects_publication() {
   local concurrent="$TMP_ROOT/concurrent-main"
   local concurrent_sha
@@ -454,8 +482,9 @@ test_orchestration_contract() {
   rg -q 'simple_release=true' "$workflow"
   rg -q 'gh run watch' "$workflow"
   rg -q 'gh release view' "$workflow"
+  rg -Fq "printf 'Sync upstream %s\\n\\n'" "$workflow"
   rg -Fq '.github/scripts/sync-upstream.sh render-custom-notes \' "$workflow"
-  rg -Fq '.github/custom-release-notes.md >"$message_file"' "$workflow"
+  rg -Fq '.github/custom-release-notes.md >>"$message_file"' "$workflow"
   rg -Fq "printf '\\n\\n## 上游更新\\n\\n'" "$workflow"
   rg -q 'if: always\(\)' "$workflow"
   if rg -q '(^|[^A-Z_])PAT([^A-Z_]|$)' "$workflow"; then
@@ -470,6 +499,7 @@ test_merge_version_conflict
 test_rebase_version_conflict
 test_source_conflict_fails
 test_atomic_publication
+test_tag_release_notes_round_trip
 test_main_lease_rejects_publication
 test_main_race_rejects_publication_at_push
 test_candidate_mismatch_rejects_publication

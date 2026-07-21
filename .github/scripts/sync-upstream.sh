@@ -93,6 +93,23 @@ classify() {
   fi
 }
 
+render_custom_notes() {
+  local upstream_repository=$1
+  local upstream_version=$2
+  local notes_file=$3
+
+  validate_version "$upstream_version"
+  [[ $upstream_repository =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || die "invalid upstream repository: $upstream_repository"
+  [[ -f $notes_file ]] || die "custom release notes file does not exist: $notes_file"
+  grep -q '[^[:space:]]' "$notes_file" \
+    || die "custom release notes file is empty: $notes_file"
+
+  printf '基于上游 [v%s](https://github.com/%s/releases/tag/v%s) 同步，包含以下自定义功能。\n\n' \
+    "$upstream_version" "$upstream_repository" "$upstream_version"
+  cat "$notes_file"
+}
+
 only_version_conflicted() {
   local conflicts
 
@@ -282,6 +299,10 @@ case "$command" in
   classify)
     [[ $# == 4 ]] || die 'usage: classify UPSTREAM LATEST TAG_EXISTS RELEASE_EXISTS'
     classify "$@"
+    ;;
+  render-custom-notes)
+    [[ $# == 3 ]] || die 'usage: render-custom-notes UPSTREAM_REPOSITORY UPSTREAM_VERSION NOTES_FILE'
+    render_custom_notes "$@"
     ;;
   prepare)
     [[ $# == 2 ]] || die 'usage: prepare UPSTREAM_VERSION CANDIDATE_BRANCH'

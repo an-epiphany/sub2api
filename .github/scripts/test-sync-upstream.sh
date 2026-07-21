@@ -388,6 +388,27 @@ test_candidate_cleanup_scope() {
   assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" "refs/heads/$keep_branch")"
 }
 
+test_custom_release_notes() {
+  local notes="$TMP_ROOT/custom-release-notes.md"
+  local expected
+  local actual
+
+  printf '## 自定义功能\n\n- 功能 A\n' >"$notes"
+  expected=$'基于上游 [v0.1.163](https://github.com/Wei-Shaw/sub2api/releases/tag/v0.1.163) 同步，包含以下自定义功能。\n\n## 自定义功能\n\n- 功能 A'
+  actual=$("$SCRIPT" render-custom-notes Wei-Shaw/sub2api 0.1.163 "$notes")
+
+  assert_eq "$expected" "$actual"
+}
+
+test_custom_release_notes_rejects_missing_or_empty_file() {
+  local empty="$TMP_ROOT/empty-custom-release-notes.md"
+
+  printf ' \n\t\n' >"$empty"
+  assert_fails "$SCRIPT" render-custom-notes \
+    Wei-Shaw/sub2api 0.1.163 "$TMP_ROOT/missing-custom-release-notes.md"
+  assert_fails "$SCRIPT" render-custom-notes Wei-Shaw/sub2api 0.1.163 "$empty"
+}
+
 test_workflow_entry_points() {
   rg -q '^  workflow_dispatch:' "$ROOT/.github/workflows/backend-ci.yml"
   rg -Fq 'run-name: Release ${{ github.event.inputs.tag || github.ref_name }}' \
@@ -441,6 +462,8 @@ test_main_lease_rejects_publication
 test_main_race_rejects_publication_at_push
 test_candidate_mismatch_rejects_publication
 test_candidate_cleanup_scope
+test_custom_release_notes
+test_custom_release_notes_rejects_missing_or_empty_file
 test_workflow_entry_points
 test_orchestration_contract
 printf 'all sync-upstream tests passed\n'

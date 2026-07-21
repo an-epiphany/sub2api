@@ -348,6 +348,12 @@ test_candidate_cleanup_scope() {
   assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" "refs/heads/$keep_branch")"
 }
 
+test_workflow_entry_points() {
+  rg -q '^  workflow_dispatch:' "$ROOT/.github/workflows/backend-ci.yml"
+  rg -Fq 'run-name: Release ${{ github.event.inputs.tag || github.ref_name }}' \
+    "$ROOT/.github/workflows/release.yml"
+}
+
 test_version_state
 test_normal_preparation
 test_merge_version_conflict
@@ -357,4 +363,5 @@ test_atomic_publication
 test_main_lease_rejects_publication
 test_candidate_mismatch_rejects_publication
 test_candidate_cleanup_scope
+test_workflow_entry_points
 printf 'all sync-upstream tests passed\n'

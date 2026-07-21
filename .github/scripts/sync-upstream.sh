@@ -7,6 +7,8 @@ MAIN_BRANCH=main
 CUSTOM_BRANCH=feat/openai-403-config
 CUSTOM_SUFFIX=custom1
 CANDIDATE_PREFIX=automation/upstream-sync-
+PREPARED_MAIN_BRANCH=automation-prepared-main
+PREPARED_CUSTOM_BRANCH=automation-prepared-custom
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -91,6 +93,109 @@ classify() {
   fi
 }
 
+only_version_conflicted() {
+  local conflicts
+
+  conflicts=$(git diff --name-only --diff-filter=U)
+  [[ $conflicts == "$VERSION_FILE" ]]
+}
+
+merge_upstream() {
+  local merge_status
+
+  set +e
+  GIT_MERGE_AUTOEDIT=no git merge --no-edit "upstream/$MAIN_BRANCH" >&2
+  merge_status=$?
+  set -e
+
+  if (( merge_status == 0 )); then
+    return
+  fi
+
+  if ! only_version_conflicted; then
+    git merge --abort >/dev/null 2>&1 || true
+    die 'upstream merge has conflicts outside the VERSION file'
+  fi
+
+  git show "upstream/$MAIN_BRANCH:$VERSION_FILE" >"$VERSION_FILE"
+  git add "$VERSION_FILE"
+  GIT_EDITOR=true git commit --no-edit >&2
+}
+
+continue_rebase() {
+  local rebase_status
+
+  set +e
+  GIT_EDITOR=true git rebase "$PREPARED_MAIN_BRANCH" >&2
+  rebase_status=$?
+  set -e
+
+  while (( rebase_status != 0 )); do
+    if ! git rev-parse --verify --quiet REBASE_HEAD >/dev/null; then
+      git rebase --abort >/dev/null 2>&1 || true
+      die 'custom branch rebase failed without a resolvable conflict'
+    fi
+
+    if ! only_version_conflicted; then
+      git rebase --abort >/dev/null 2>&1 || true
+      die 'custom branch rebase has conflicts outside the VERSION file'
+    fi
+
+    git show "$PREPARED_MAIN_BRANCH:$VERSION_FILE" >"$VERSION_FILE"
+    git add "$VERSION_FILE"
+
+    set +e
+    if git diff --cached --quiet; then
+      GIT_EDITOR=true git rebase --skip >&2
+    else
+      GIT_EDITOR=true git rebase --continue >&2
+    fi
+    rebase_status=$?
+    set -e
+  done
+}
+
+prepare() {
+  local upstream_version=$1
+  local candidate_branch=$2
+  local origin_main_sha
+  local origin_custom_sha
+  local prepared_main_sha
+  local prepared_custom_sha
+  local target_version
+
+  validate_version "$upstream_version"
+  [[ $candidate_branch == "$CANDIDATE_PREFIX"* ]] || die "invalid candidate branch: $candidate_branch"
+  git check-ref-format --branch "$candidate_branch" >/dev/null || die "invalid candidate branch: $candidate_branch"
+
+  origin_main_sha=$(git rev-parse --verify "origin/$MAIN_BRANCH")
+  origin_custom_sha=$(git rev-parse --verify "origin/$CUSTOM_BRANCH")
+  git rev-parse --verify "upstream/$MAIN_BRANCH" >/dev/null
+
+  git switch -C "$PREPARED_MAIN_BRANCH" "$origin_main_sha" >&2
+  merge_upstream
+  prepared_main_sha=$(git rev-parse HEAD)
+
+  git switch -C "$PREPARED_CUSTOM_BRANCH" "$origin_custom_sha" >&2
+  continue_rebase
+
+  target_version="${upstream_version}-${CUSTOM_SUFFIX}"
+  printf '%s\n' "$target_version" >"$VERSION_FILE"
+  git add "$VERSION_FILE"
+  if ! git diff --cached --quiet; then
+    git commit -m "chore: sync VERSION to $target_version" >&2
+  fi
+  prepared_custom_sha=$(git rev-parse HEAD)
+
+  printf 'origin_main_sha=%s\n' "$origin_main_sha"
+  printf 'origin_custom_sha=%s\n' "$origin_custom_sha"
+  printf 'prepared_main_sha=%s\n' "$prepared_main_sha"
+  printf 'prepared_custom_sha=%s\n' "$prepared_custom_sha"
+  printf 'candidate_branch=%s\n' "$candidate_branch"
+  printf 'target_version=%s\n' "$target_version"
+  printf 'target_tag=v%s\n' "$target_version"
+}
+
 command=${1:-}
 shift || true
 
@@ -102,6 +207,10 @@ case "$command" in
   classify)
     [[ $# == 4 ]] || die 'usage: classify UPSTREAM LATEST TAG_EXISTS RELEASE_EXISTS'
     classify "$@"
+    ;;
+  prepare)
+    [[ $# == 2 ]] || die 'usage: prepare UPSTREAM_VERSION CANDIDATE_BRANCH'
+    prepare "$@"
     ;;
   *)
     die "unknown command: ${command:-<empty>}"

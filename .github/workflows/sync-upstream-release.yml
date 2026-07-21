@@ -1,0 +1,261 @@
+name: Sync Upstream and Release
+run-name: Sync upstream (${{ github.event_name }})
+
+on:
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-auto-release
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
+  MAIN_BRANCH: main
+  CUSTOM_BRANCH: feat/openai-403-config
+  VERSION_FILE: backend/cmd/server/VERSION
+  CANDIDATE_BRANCH: automation/upstream-sync-${{ github.run_id }}-${{ github.run_attempt }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure repositories
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          else
+            git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          fi
+
+          git fetch --force --prune origin \
+            "+refs/heads/${MAIN_BRANCH}:refs/remotes/origin/${MAIN_BRANCH}" \
+            "+refs/heads/${CUSTOM_BRANCH}:refs/remotes/origin/${CUSTOM_BRANCH}" \
+            "+refs/tags/*:refs/tags/*"
+          git fetch --force --prune upstream \
+            "+refs/heads/${MAIN_BRANCH}:refs/remotes/upstream/${MAIN_BRANCH}" \
+            "+refs/tags/*:refs/tags/*"
+
+      - name: Remove stale candidate branches
+        run: .github/scripts/sync-upstream.sh cleanup-candidates
+
+      - name: Inspect upstream and release state
+        id: inspect
+        run: |
+          set -euo pipefail
+          releases_file=$(mktemp)
+          upstream_version=$(git show "upstream/${MAIN_BRANCH}:${VERSION_FILE}" | tr -d '\r\n')
+
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' >"$releases_file"
+          latest_version=$(.github/scripts/sync-upstream.sh latest-release <"$releases_file")
+
+          # Validate version order before deriving a tag or using it in a Git command.
+          .github/scripts/sync-upstream.sh classify \
+            "$upstream_version" "$latest_version" false false >/dev/null
+
+          target_tag="v${upstream_version}-custom1"
+          tag_exists=false
+          release_exists=false
+          if git ls-remote --exit-code --tags origin "refs/tags/${target_tag}" >/dev/null 2>&1; then
+            tag_exists=true
+          fi
+          if grep -Fqx "$target_tag" "$releases_file"; then
+            release_exists=true
+          fi
+
+          decision=$(.github/scripts/sync-upstream.sh classify \
+            "$upstream_version" "$latest_version" "$tag_exists" "$release_exists")
+
+          printf 'upstream_version=%s\n' "$upstream_version" >>"$GITHUB_OUTPUT"
+          printf 'latest_version=%s\n' "$latest_version" >>"$GITHUB_OUTPUT"
+          printf 'target_tag=%s\n' "$target_tag" >>"$GITHUB_OUTPUT"
+          printf 'decision=%s\n' "$decision" >>"$GITHUB_OUTPUT"
+          printf 'Decision: %s (%s)\n' "$decision" "$target_tag"
+
+      - name: Report no update
+        if: steps.inspect.outputs.decision == 'noop'
+        env:
+          TARGET_TAG: ${{ steps.inspect.outputs.target_tag }}
+        run: echo "${TARGET_TAG} is already released; nothing to do."
+
+      - name: Prepare synchronized branches
+        if: steps.inspect.outputs.decision == 'prepare'
+        id: prepare
+        env:
+          UPSTREAM_VERSION: ${{ steps.inspect.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          .github/scripts/sync-upstream.sh prepare \
+            "$UPSTREAM_VERSION" "$CANDIDATE_BRANCH" >>"$GITHUB_OUTPUT"
+
+      - name: Push candidate branch
+        if: steps.inspect.outputs.decision == 'prepare'
+        env:
+          PREPARED_CUSTOM_SHA: ${{ steps.prepare.outputs.prepared_custom_sha }}
+        run: |
+          set -euo pipefail
+          git push origin \
+            "${PREPARED_CUSTOM_SHA}:refs/heads/${CANDIDATE_BRANCH}"
+
+      - name: Run Backend CI on candidate
+        if: steps.inspect.outputs.decision == 'prepare'
+        env:
+          PREPARED_CUSTOM_SHA: ${{ steps.prepare.outputs.prepared_custom_sha }}
+        run: |
+          set -euo pipefail
+          dispatch_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          gh workflow run backend-ci.yml --ref "$CANDIDATE_BRANCH"
+
+          run_id=''
+          for _ in $(seq 1 60); do
+            run_id=$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/backend-ci.yml/runs" \
+              -f event=workflow_dispatch \
+              -f per_page=50 \
+              --jq ".workflow_runs
+                | map(select(.head_sha == \"${PREPARED_CUSTOM_SHA}\" and .created_at >= \"${dispatch_time}\"))
+                | sort_by(.created_at)
+                | last
+                | .id // empty")
+            [[ -z $run_id ]] || break
+            sleep 5
+          done
+
+          [[ -n $run_id ]] || {
+            echo "Backend CI run did not appear within five minutes" >&2
+            exit 1
+          }
+          echo "Watching Backend CI run ${run_id}"
+          gh run watch "$run_id" --exit-status --interval 10
+
+      - name: Build tag message
+        if: steps.inspect.outputs.decision == 'prepare'
+        id: tag-message
+        env:
+          UPSTREAM_VERSION: ${{ steps.inspect.outputs.upstream_version }}
+          LATEST_VERSION: ${{ steps.inspect.outputs.latest_version }}
+        run: |
+          set -euo pipefail
+          message_file="${RUNNER_TEMP}/upstream-release-notes.md"
+          upstream_tag="v${UPSTREAM_VERSION}"
+          release_json=$(mktemp)
+
+          printf 'Synced from [%s %s](https://github.com/%s/releases/tag/%s).\n\n' \
+            "$UPSTREAM_REPOSITORY" "$upstream_tag" "$UPSTREAM_REPOSITORY" "$upstream_tag" \
+            >"$message_file"
+
+          if gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${upstream_tag}" \
+              >"$release_json" 2>/dev/null \
+              && [[ $(jq -r '.draft' "$release_json") == false ]] \
+              && [[ -n $(jq -r '.body // empty' "$release_json") ]]; then
+            jq -r '.body' "$release_json" >>"$message_file"
+          else
+            printf '## Upstream changes\n\n' >>"$message_file"
+            if [[ -n $LATEST_VERSION ]] \
+                && git rev-parse --verify --quiet "refs/tags/v${LATEST_VERSION}^{commit}" >/dev/null; then
+              git log --format='- %s' -n 100 \
+                "v${LATEST_VERSION}..upstream/${MAIN_BRANCH}" >>"$message_file"
+              printf '\n[Compare upstream changes](https://github.com/%s/compare/v%s...v%s)\n' \
+                "$UPSTREAM_REPOSITORY" "$LATEST_VERSION" "$UPSTREAM_VERSION" \
+                >>"$message_file"
+            else
+              git log --format='- %s' -n 100 "upstream/${MAIN_BRANCH}" >>"$message_file"
+              printf '\n[View upstream history](https://github.com/%s/commits/%s)\n' \
+                "$UPSTREAM_REPOSITORY" "$MAIN_BRANCH" >>"$message_file"
+            fi
+          fi
+
+          printf '\n## Image\n\n`ghcr.io/an-epiphany/sub2api:%s-custom1`\n' \
+            "$UPSTREAM_VERSION" >>"$message_file"
+          printf 'path=%s\n' "$message_file" >>"$GITHUB_OUTPUT"
+
+      - name: Publish tested refs
+        if: steps.inspect.outputs.decision == 'prepare'
+        env:
+          ORIGIN_MAIN_SHA: ${{ steps.prepare.outputs.origin_main_sha }}
+          ORIGIN_CUSTOM_SHA: ${{ steps.prepare.outputs.origin_custom_sha }}
+          PREPARED_MAIN_SHA: ${{ steps.prepare.outputs.prepared_main_sha }}
+          PREPARED_CUSTOM_SHA: ${{ steps.prepare.outputs.prepared_custom_sha }}
+          TARGET_TAG: ${{ steps.inspect.outputs.target_tag }}
+          TAG_MESSAGE_FILE: ${{ steps.tag-message.outputs.path }}
+        run: |
+          set -euo pipefail
+          .github/scripts/sync-upstream.sh publish \
+            "$ORIGIN_MAIN_SHA" \
+            "$ORIGIN_CUSTOM_SHA" \
+            "$PREPARED_MAIN_SHA" \
+            "$PREPARED_CUSTOM_SHA" \
+            "$CANDIDATE_BRANCH" \
+            "$TARGET_TAG" \
+            "$TAG_MESSAGE_FILE"
+
+      - name: Run Release workflow
+        if: steps.inspect.outputs.decision != 'noop'
+        env:
+          TARGET_TAG: ${{ steps.inspect.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TARGET_TAG}:refs/tags/${TARGET_TAG}"
+          target_sha=$(git rev-list -n 1 "$TARGET_TAG")
+          dispatch_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          expected_title="Release ${TARGET_TAG}"
+
+          gh workflow run release.yml \
+            --ref "$TARGET_TAG" \
+            -f tag="$TARGET_TAG" \
+            -f simple_release=true
+
+          run_id=''
+          for _ in $(seq 1 60); do
+            run_id=$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs" \
+              -f event=workflow_dispatch \
+              -f per_page=50 \
+              --jq ".workflow_runs
+                | map(select(
+                    .head_sha == \"${target_sha}\"
+                    and .display_title == \"${expected_title}\"
+                    and .created_at >= \"${dispatch_time}\"
+                  ))
+                | sort_by(.created_at)
+                | last
+                | .id // empty")
+            [[ -z $run_id ]] || break
+            sleep 5
+          done
+
+          [[ -n $run_id ]] || {
+            echo "Release run did not appear within five minutes" >&2
+            exit 1
+          }
+          echo "Watching Release run ${run_id}"
+          gh run watch "$run_id" --exit-status --interval 10
+
+          [[ $(gh release view "$TARGET_TAG" --json isDraft --jq '.isDraft') == false ]] || {
+            echo "Published Release not found for ${TARGET_TAG}" >&2
+            exit 1
+          }
+
+      - name: Clean up candidate branches
+        if: always()
+        continue-on-error: true
+        run: .github/scripts/sync-upstream.sh cleanup-candidates

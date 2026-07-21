@@ -354,6 +354,27 @@ test_workflow_entry_points() {
     "$ROOT/.github/workflows/release.yml"
 }
 
+test_orchestration_contract() {
+  local workflow="$ROOT/.github/workflows/sync-upstream-release.yml"
+
+  [[ -f $workflow ]]
+  rg -q "cron: '17 1 \* \* \*'" "$workflow"
+  rg -q '^  workflow_dispatch:' "$workflow"
+  rg -q 'cancel-in-progress: false' "$workflow"
+  rg -q '^  actions: write' "$workflow"
+  rg -q '^  contents: write' "$workflow"
+  rg -q 'backend-ci\.yml' "$workflow"
+  rg -q 'release\.yml' "$workflow"
+  rg -q 'simple_release=true' "$workflow"
+  rg -q 'gh run watch' "$workflow"
+  rg -q 'gh release view' "$workflow"
+  rg -q 'if: always\(\)' "$workflow"
+  if rg -q '(^|[^A-Z_])PAT([^A-Z_]|$)' "$workflow"; then
+    printf 'workflow must not depend on a PAT\n' >&2
+    return 1
+  fi
+}
+
 test_version_state
 test_normal_preparation
 test_merge_version_conflict
@@ -364,4 +385,5 @@ test_main_lease_rejects_publication
 test_candidate_mismatch_rejects_publication
 test_candidate_cleanup_scope
 test_workflow_entry_points
+test_orchestration_contract
 printf 'all sync-upstream tests passed\n'

@@ -1,10 +1,16 @@
 name: Sync Upstream and Release
-run-name: Sync upstream (${{ github.event_name }})
+run-name: Sync upstream (${{ github.event_name }}${{ inputs.force_release && ', force' || '' }})
 
 on:
   schedule:
     - cron: '17 1 * * *'
   workflow_dispatch:
+    inputs:
+      force_release:
+        description: '强制发版：即使当前上游版本已发布，也删除并重建 Release/tag（镜像同 tag 重推）'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: upstream-auto-release
@@ -59,6 +65,8 @@ jobs:
 
       - name: Inspect upstream and release state
         id: inspect
+        env:
+          FORCE_RELEASE: ${{ inputs.force_release && 'true' || 'false' }}
         run: |
           set -euo pipefail
           releases_file=$(mktemp)
@@ -86,11 +94,21 @@ jobs:
           decision=$(.github/scripts/sync-upstream.sh classify \
             "$upstream_version" "$latest_version" "$tag_exists" "$release_exists")
 
+          # 手动强制发版：已发布(noop)或 tag 残留(retry-release)时改走完整
+          # prepare 流程，并在 publish 前删除既有 Release/tag 后重建。
+          forced=false
+          if [[ $FORCE_RELEASE == true && $decision != prepare ]]; then
+            forced=true
+            decision=prepare
+            printf 'Force release requested: will recreate %s\n' "$target_tag"
+          fi
+
           printf 'upstream_version=%s\n' "$upstream_version" >>"$GITHUB_OUTPUT"
           printf 'latest_version=%s\n' "$latest_version" >>"$GITHUB_OUTPUT"
           printf 'target_tag=%s\n' "$target_tag" >>"$GITHUB_OUTPUT"
           printf 'decision=%s\n' "$decision" >>"$GITHUB_OUTPUT"
-          printf 'Decision: %s (%s)\n' "$decision" "$target_tag"
+          printf 'forced=%s\n' "$forced" >>"$GITHUB_OUTPUT"
+          printf 'Decision: %s (%s, forced=%s)\n' "$decision" "$target_tag" "$forced"
 
       - name: Report no update
         if: steps.inspect.outputs.decision == 'noop'
@@ -195,6 +213,27 @@ jobs:
           printf '\n## Image\n\n`ghcr.io/an-epiphany/sub2api:%s-custom1`\n' \
             "$UPSTREAM_VERSION" >>"$message_file"
           printf 'path=%s\n' "$message_file" >>"$GITHUB_OUTPUT"
+
+      # 仅强制发版时执行：删除既有 Release 与 tag（远端+本地），随后 publish 重建
+      # 同名 tag 并由 tag push 重新触发 release.yml（Release 与镜像同 tag 覆盖）。
+      # 放在候选分支 Backend CI 通过之后，尽量缩短"无 Release"的窗口。
+      - name: Remove existing release and tag (forced)
+        if: steps.inspect.outputs.decision == 'prepare' && steps.inspect.outputs.forced == 'true'
+        env:
+          TARGET_TAG: ${{ steps.inspect.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TARGET_TAG" --json isDraft --jq '.isDraft' >/dev/null 2>&1; then
+            gh release delete "$TARGET_TAG" --yes
+            echo "Deleted release ${TARGET_TAG}"
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TARGET_TAG}" >/dev/null 2>&1; then
+            git push origin --delete "refs/tags/${TARGET_TAG}"
+            echo "Deleted remote tag ${TARGET_TAG}"
+          fi
+          if git show-ref --verify --quiet "refs/tags/${TARGET_TAG}"; then
+            git tag -d "$TARGET_TAG"
+          fi
 
       - name: Publish tested refs
         if: steps.inspect.outputs.decision == 'prepare'

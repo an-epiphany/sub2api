@@ -1097,3 +1097,15 @@ func fetchProjectIDFromResourceManager(ctx context.Context, accessToken, proxyUR
 
 	return strings.TrimSpace(active[0].ProjectID), nil
 }
+
+// WithSessionStore 替换进程内存的 OAuth 会话存储（多副本部署下换成 Redis 版）。
+// Redis 装配留在 wire provider 里，避免本包直接 import go-redis（depguard 约束）。
+func (s *GeminiOAuthService) WithSessionStore(store *geminicli.SessionStore) *GeminiOAuthService {
+	if s != nil && store != nil {
+		if s.sessionStore != nil {
+			s.sessionStore.Stop()
+		}
+		s.sessionStore = store
+	}
+	return s
+}

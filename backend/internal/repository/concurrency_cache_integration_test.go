@@ -479,7 +479,7 @@ func (s *ConcurrencyCacheSuite) TestCleanupStaleProcessSlots() {
 		Member: strconv.FormatInt(userID, 10),
 	}).Err())
 
-	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep-"))
+	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep"))
 
 	accountMembers, err := s.rdb.ZRange(s.ctx, accountKey, 0, -1).Result()
 	require.NoError(s.T(), err)
@@ -744,7 +744,7 @@ func (s *ConcurrencyCacheSuite) TestCleanupStaleProcessSlots_LegacyWaitSweepRuns
 	require.NoError(s.T(), s.rdb.Set(s.ctx, unindexedUserWaitKey, 3, time.Minute).Err())
 
 	// 首次运行：marker 不存在，一次性清扫删除所有遗留等待计数（含未入索引的）。
-	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep-"))
+	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep"))
 
 	_, err := s.rdb.Get(s.ctx, unindexedAccountWaitKey).Result()
 	require.ErrorIs(s.T(), err, redis.Nil, "legacy account wait key should be swept on first startup")
@@ -757,7 +757,7 @@ func (s *ConcurrencyCacheSuite) TestCleanupStaleProcessSlots_LegacyWaitSweepRuns
 
 	// 再次运行：marker 已存在，未入索引的等待计数不再被触碰。
 	require.NoError(s.T(), s.rdb.Set(s.ctx, unindexedAccountWaitKey, 5, time.Minute).Err())
-	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep-"))
+	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep"))
 	val, err := s.rdb.Get(s.ctx, unindexedAccountWaitKey).Int()
 	require.NoError(s.T(), err, "sweep must not run twice")
 	require.Equal(s.T(), 5, val)
@@ -791,7 +791,7 @@ func (s *ConcurrencyCacheSuite) TestCleanupStaleProcessSlots_ProcessesExpiredInd
 		Member: strconv.FormatInt(userID, 10),
 	}).Err())
 
-	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep-"))
+	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "keep"))
 
 	exists, err := s.rdb.Exists(s.ctx, accountKey).Result()
 	require.NoError(s.T(), err)
@@ -843,7 +843,7 @@ func (s *ConcurrencyCacheSuite) TestCleanupStaleProcessSlots_RemovesOldPrefixesA
 		Member: strconv.FormatInt(userID, 10),
 	}).Err())
 
-	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "activeproc-"))
+	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "activeproc"))
 
 	accountMembers, err := s.rdb.ZRange(s.ctx, accountSlotKey, 0, -1).Result()
 	require.NoError(s.T(), err)
@@ -871,7 +871,7 @@ func (s *ConcurrencyCacheSuite) TestCleanupStaleProcessSlots_DeletesEmptySlotKey
 		Member: strconv.FormatInt(accountID, 10),
 	}).Err())
 
-	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "activeproc-"))
+	require.NoError(s.T(), s.cache.CleanupStaleProcessSlots(s.ctx, "activeproc"))
 
 	exists, err := s.rdb.Exists(s.ctx, accountSlotKey).Result()
 	require.NoError(s.T(), err)

@@ -158,6 +158,21 @@ type ChannelService struct {
 
 	cache   atomic.Value // *channelCache
 	cacheSF singleflight.Group
+
+	// snapshotInvalidator 把快照失效广播到全部副本。多副本下管理请求只会落到
+	// 其中一个副本，不广播的话其余副本要等 channelCacheTTL（10 分钟）才生效，
+	// 期间同一个用户在不同副本会被按不同单价计费。
+	snapshotInvalidator *SnapshotInvalidator
+}
+
+// SetSnapshotInvalidationCache 注入跨实例失效广播通道并启动订阅。
+// 未注入时（单实例部署、单元测试）退化为纯本地失效。
+func (s *ChannelService) SetSnapshotInvalidationCache(ctx context.Context, cache SnapshotInvalidationCache) {
+	if s == nil {
+		return
+	}
+	s.snapshotInvalidator = NewSnapshotInvalidator(cache, SnapshotTopicChannel, s.invalidateLocalCache)
+	s.snapshotInvalidator.Start(ctx)
 }
 
 // NewChannelService 创建渠道服务实例。
@@ -382,7 +397,19 @@ func (s *ChannelService) InvalidateCache() {
 	s.invalidateCache()
 }
 
+// invalidateCache 失效本快照并通知其余副本。
+// 广播成功时本地失效由订阅回调完成；未接入广播通道时直接本地失效。
 func (s *ChannelService) invalidateCache() {
+	if s.snapshotInvalidator != nil {
+		s.snapshotInvalidator.InvalidateAndBroadcast(context.Background())
+		return
+	}
+	s.invalidateLocalCache()
+}
+
+// invalidateLocalCache 只失效本进程快照，绝不广播——它同时是订阅回调，
+// 若在这里再发一次广播，一条失效消息会在副本之间无限回弹。
+func (s *ChannelService) invalidateLocalCache() {
 	s.cache.Store((*channelCache)(nil))
 	s.cacheSF.Forget("channel_cache")
 

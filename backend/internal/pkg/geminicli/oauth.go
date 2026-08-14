@@ -14,6 +14,8 @@ import (
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/redissession"
+	"github.com/redis/go-redis/v9"
 )
 
 type OAuthConfig struct {
@@ -36,55 +38,63 @@ type OAuthSession struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// SessionStore 管理 OAuth 会话。注入 Redis 后会话在所有副本间共享，
+// 未注入时退化为纯进程内存（单实例部署与单元测试）。
 type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*OAuthSession
+	mirror   *redissession.Mirror[OAuthSession]
+	stopOnce sync.Once
 	stopCh   chan struct{}
 }
 
+// NewSessionStore 创建纯进程内存的会话存储。
 func NewSessionStore() *SessionStore {
+	return newSessionStore(nil)
+}
+
+// NewRedisSessionStore 创建以 Redis 为共享后端的会话存储。
+//
+// 管理端加账号是两次独立的 HTTP 请求，中间隔着用户在浏览器授权的数分钟，
+// 多副本下第二次请求会落到任意副本；会话不共享时 exchange-code 成功率为 1/N。
+func NewRedisSessionStore(rdb *redis.Client) *SessionStore {
+	if rdb == nil {
+		return NewSessionStore()
+	}
+	return newSessionStore(redissession.New(rdb, "oauth:session:gemini", SessionTTL))
+}
+
+func newSessionStore(remote *redissession.Store) *SessionStore {
 	store := &SessionStore{
-		sessions: make(map[string]*OAuthSession),
-		stopCh:   make(chan struct{}),
+		mirror: redissession.NewMirror(remote, SessionTTL, "gemini",
+			func(s *OAuthSession) time.Time { return s.CreatedAt }),
+		stopCh: make(chan struct{}),
 	}
 	go store.cleanup()
 	return store
 }
 
+// Set 存储会话。
 func (s *SessionStore) Set(sessionID string, session *OAuthSession) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[sessionID] = session
+	s.mirror.Set(sessionID, session)
 }
 
+// Get 读取会话，过期或不存在时返回 false。
 func (s *SessionStore) Get(sessionID string) (*OAuthSession, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	session, ok := s.sessions[sessionID]
-	if !ok {
-		return nil, false
-	}
-	if time.Since(session.CreatedAt) > SessionTTL {
-		return nil, false
-	}
-	return session, true
+	return s.mirror.Get(sessionID)
 }
 
+// Delete 删除会话。
 func (s *SessionStore) Delete(sessionID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.sessions, sessionID)
+	s.mirror.Delete(sessionID)
 }
 
+// Stop 停止本地过期清理协程。
 func (s *SessionStore) Stop() {
-	select {
-	case <-s.stopCh:
-		return
-	default:
+	s.stopOnce.Do(func() {
 		close(s.stopCh)
-	}
+	})
 }
 
+// cleanup 周期清理本进程内存中的过期会话；Redis 侧由 key TTL 自然过期。
 func (s *SessionStore) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -93,13 +103,7 @@ func (s *SessionStore) cleanup() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			for id, session := range s.sessions {
-				if time.Since(session.CreatedAt) > SessionTTL {
-					delete(s.sessions, id)
-				}
-			}
-			s.mu.Unlock()
+			s.mirror.Sweep()
 		}
 	}
 }

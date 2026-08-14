@@ -86,16 +86,20 @@ func (s *SettingService) UpdateSettingsWithAuthSourceDefaultsOmitting(ctx contex
 // it omitted, so in that case the caches are rebuilt from storage rather than
 // from the request struct.
 func (s *SettingService) refreshCachedSettingsAfterWrite(ctx context.Context, settings *SystemSettings, omitted OmittedSettingKeys) {
+	// 本副本手里就有新值，直接刷新，省掉一次回读。
 	if len(omitted) == 0 {
 		s.refreshCachedSettings(settings)
-		return
+	} else {
+		stored, err := s.GetAllSettings(ctx)
+		if err != nil {
+			slog.Warn("refresh cached settings after partial update failed", "error", err)
+			return
+		}
+		s.refreshCachedSettings(stored)
 	}
-	stored, err := s.GetAllSettings(ctx)
-	if err != nil {
-		slog.Warn("refresh cached settings after partial update failed", "error", err)
-		return
-	}
-	s.refreshCachedSettings(stored)
+	// 其余副本没有这次写入的内容，只能收到广播后自己回读一遍。
+	// 不广播的话它们要等各自缓存的 TTL（约 60 秒）才生效。
+	s.broadcastSettingsInvalidation(ctx)
 }
 
 func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, settings *SystemSettings) (map[string]string, error) {

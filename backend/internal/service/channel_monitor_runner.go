@@ -2,14 +2,28 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
 
 	"github.com/alitto/pond/v2"
+	"github.com/google/uuid"
 )
+
+// channelMonitorFireLeaderLockKey 按 monitor 维度做跨实例互斥：同一个监控在一次
+// 触发窗口内只允许一个副本真正探测，不同监控仍可分散到不同副本上并行执行。
+// 用整体锁会把所有监控串行化到单个副本，白白浪费其余副本的探测能力。
+func channelMonitorFireLeaderLockKey(monitorID int64) string {
+	return fmt.Sprintf("channel_monitor:fire:%d", monitorID)
+}
+
+// channelMonitorFireLeaderLockTTL 必须覆盖 runOne 的 ctx 上限，
+// 否则锁会在检测途中过期，第二个副本进来重复探测同一个上游。
+const channelMonitorFireLeaderLockTTL = monitorRequestTimeout + monitorPingTimeout + monitorRunOneBuffer + 30*time.Second
 
 // MonitorScheduler 调度器接口，供 ChannelMonitorService 在 CRUD 时回调，
 // 用 setter 注入避免 service ↔ runner 的 wire 依赖环。
@@ -61,8 +75,23 @@ type ChannelMonitorRunner struct {
 
 	// inFlight 跟踪正在执行的 monitor.ID。fire 调度前会检查避免重复提交，
 	// 防止单次检测耗时 > interval 时同一 monitor 被并发执行。
+	// 注意它只是进程内闸门：多副本下每个 Pod 各有一份，挡不住跨实例重复探测，
+	// 那一层由 runOne 里的 leader lock 负责。
 	inFlight   map[int64]struct{}
 	inFlightMu sync.Mutex
+
+	lockCache  LeaderLockCache
+	db         *sql.DB
+	instanceID string
+}
+
+// SetLeaderLock 注入跨实例互斥后端。未注入时（单元测试）退化为无门控执行。
+func (r *ChannelMonitorRunner) SetLeaderLock(lockCache LeaderLockCache, db *sql.DB) {
+	if r == nil {
+		return
+	}
+	r.lockCache = lockCache
+	r.db = db
 }
 
 // scheduledMonitor 单个监控的运行时上下文。
@@ -109,6 +138,7 @@ func newChannelMonitorRunner(svc monitorRunnerSvc, settingService *SettingServic
 		parentCancel:   cancel,
 		tasks:          make(map[int64]*scheduledMonitor),
 		inFlight:       make(map[int64]struct{}),
+		instanceID:     uuid.NewString(),
 	}
 }
 
@@ -311,6 +341,19 @@ func (r *ChannelMonitorRunner) runOne(id int64, name string) {
 				"monitor_id", id, "name", name, "panic", rec)
 		}
 	}()
+
+	// 跨实例互斥必须在 releaseInFlight 之后注册，这样即使没抢到锁，
+	// 本进程的 in-flight 槽也会被正常释放，不会把该 monitor 永久卡死。
+	release, acquired := tryAcquireSingletonLeaderLock(
+		ctx, r.lockCache, r.db,
+		channelMonitorFireLeaderLockKey(id), r.instanceID, channelMonitorFireLeaderLockTTL,
+	)
+	if !acquired {
+		slog.Debug("channel_monitor: skip, another instance is checking",
+			"monitor_id", id, "name", name)
+		return
+	}
+	defer release()
 
 	if _, err := r.svc.RunCheck(ctx, id); err != nil {
 		if errors.Is(err, ErrChannelMonitorAPIKeyDecryptFailed) {

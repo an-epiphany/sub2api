@@ -2,15 +2,27 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
 const scheduledTestDefaultMaxWorkers = 10
+
+// scheduledTestRunnerLeaderLockKey 保证同一轮到期计划在整个部署里只被执行一次。
+// TTL 必须大于 runScheduledOnce 的 ctx 超时（5 分钟），否则锁会在任务跑完前过期，
+// 让第二个实例并发进入并重复打上游。
+const (
+	scheduledTestRunnerLeaderLockKey = "scheduled_test:runner:leader"
+	scheduledTestRunnerLeaderLockTTL = 10 * time.Minute
+	// scheduledTestRunnerTickDelay 让执行落在每分钟的 ~:10 而不是 :00。
+	scheduledTestRunnerTickDelay = 10 * time.Second
+)
 
 // ScheduledTestRunnerService periodically scans due test plans and executes them.
 type ScheduledTestRunnerService struct {
@@ -20,9 +32,22 @@ type ScheduledTestRunnerService struct {
 	rateLimitSvc   *RateLimitService
 	cfg            *config.Config
 
+	lockCache  LeaderLockCache
+	db         *sql.DB
+	instanceID string
+
 	cron      *cron.Cron
 	startOnce sync.Once
 	stopOnce  sync.Once
+}
+
+// SetLeaderLock 注入跨实例互斥后端。未注入时（单元测试）退化为无门控执行。
+func (s *ScheduledTestRunnerService) SetLeaderLock(lockCache LeaderLockCache, db *sql.DB) {
+	if s == nil {
+		return
+	}
+	s.lockCache = lockCache
+	s.db = db
 }
 
 // NewScheduledTestRunnerService creates a new runner.
@@ -39,6 +64,7 @@ func NewScheduledTestRunnerService(
 		accountTestSvc: accountTestSvc,
 		rateLimitSvc:   rateLimitSvc,
 		cfg:            cfg,
+		instanceID:     uuid.NewString(),
 	}
 }
 
@@ -85,11 +111,25 @@ func (s *ScheduledTestRunnerService) Stop() {
 }
 
 func (s *ScheduledTestRunnerService) runScheduled() {
-	// Delay 10s so execution lands at ~:10 of each minute instead of :00.
-	time.Sleep(10 * time.Second)
+	// Delay so execution lands at ~:10 of each minute instead of :00.
+	time.Sleep(scheduledTestRunnerTickDelay)
+	s.runScheduledOnce()
+}
 
+// runScheduledOnce 执行一轮到期计划，跨实例只允许一个执行者。
+// 每轮结束即释放锁，因此 leader 身份每轮重新竞选，不会被钉死在某个实例上。
+func (s *ScheduledTestRunnerService) runScheduledOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	release, acquired := tryAcquireSingletonLeaderLock(
+		ctx, s.lockCache, s.db,
+		scheduledTestRunnerLeaderLockKey, s.instanceID, scheduledTestRunnerLeaderLockTTL,
+	)
+	if !acquired {
+		return
+	}
+	defer release()
 
 	now := time.Now()
 	plans, err := s.planRepo.ListDue(ctx, now)

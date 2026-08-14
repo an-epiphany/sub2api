@@ -209,6 +209,67 @@ func generateRequestID() string {
 	return requestIDPrefix + "-" + strconv.FormatUint(seq, 36)
 }
 
+// InstanceRegistryCache 是存活实例注册表。多副本部署下，启动清扫必须能区分
+// 「已死进程遗留的槽位」和「同伴实例正在使用的槽位」，而这个事实只有共享存储
+// （Redis）看得到——它是唯一能观察到全部实例的地方。
+//
+// 单独声明而不并入 ConcurrencyCache，是为了让既有的 ConcurrencyCache 测试替身
+// 不必全部实现它（与 OpenAIWSIngressLeaseCache 的处理方式一致）。
+type InstanceRegistryCache interface {
+	// HeartbeatInstance 上报本进程仍然存活。
+	HeartbeatInstance(ctx context.Context, requestPrefix string) error
+	// InstanceHeartbeatInterval 是上报间隔。它必须显著小于注册表判定实例已死的
+	// 阈值，因此由注册表实现方给出，避免两个常量在不同包里各自演化。
+	InstanceHeartbeatInterval() time.Duration
+}
+
+// StartInstanceHeartbeat 周期上报本进程心跳，返回停止函数。
+//
+// 必须独立于 StartSlotCleanupWorker：后者的间隔可配置、甚至可以关闭（设为 0），
+// 而心跳一旦断掉，本进程就会被注册表判定为已死，在途槽位会在下一次同伴实例启动
+// 清扫时被回收，账号/用户并发上限被瞬间架空。
+func (s *ConcurrencyService) StartInstanceHeartbeat() func() {
+	noop := func() {}
+	if s == nil || s.cache == nil {
+		return noop
+	}
+	registry, ok := s.cache.(InstanceRegistryCache)
+	if !ok {
+		return noop
+	}
+	interval := registry.InstanceHeartbeatInterval()
+	if interval <= 0 {
+		return noop
+	}
+
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), instanceHeartbeatTimeout)
+				err := registry.HeartbeatInstance(ctx, RequestIDPrefix())
+				cancel()
+				if err != nil {
+					logger.LegacyPrintf("service.concurrency", "Warning: instance heartbeat failed: %v", err)
+				}
+			}
+		}
+	}()
+
+	return func() { stopOnce.Do(func() { close(stopCh) }) }
+}
+
+// instanceHeartbeatTimeout 单次心跳的 Redis 操作上限。心跳超时不致命：
+// 下一个 tick 会重试，只要在注册表的存活阈值内成功一次即可。
+const instanceHeartbeatTimeout = 5 * time.Second
+
 func (s *ConcurrencyService) CleanupStaleProcessSlots(ctx context.Context) error {
 	if s == nil || s.cache == nil {
 		return nil

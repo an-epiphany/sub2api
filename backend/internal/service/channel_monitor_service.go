@@ -29,6 +29,10 @@ type ChannelMonitorRepository interface {
 	// 调度器辅助
 	ListEnabled(ctx context.Context) ([]*ChannelMonitor, error)
 	MarkChecked(ctx context.Context, id int64, checkedAt time.Time) error
+	// TryClaimCheck 原子地声明「这一轮触发窗口归调用方执行」：仅当监控仍启用、
+	// 且 last_checked_at 早于 notCheckedSince（或从未检测过）时把它推进到 claimedAt。
+	// 返回是否声明成功。
+	TryClaimCheck(ctx context.Context, id int64, notCheckedSince, claimedAt time.Time) (bool, error)
 	InsertHistoryBatch(ctx context.Context, rows []*ChannelMonitorHistoryRow) error
 	DeleteHistoryBefore(ctx context.Context, before time.Time) (int64, error)
 
@@ -449,6 +453,25 @@ func (s *ChannelMonitorService) ListHistory(ctx context.Context, id int64, model
 }
 
 // ---------- 业务 ----------
+
+// TryClaimScheduledCheck 声明「本轮触发窗口由本副本执行」，window 内已经被探测过就返回 false。
+//
+// 判定必须放在数据库：last_checked_at 是「这个监控上一次何时被探测」的所有者，
+// 一次条件 UPDATE 就能在所有副本之间原子决出唯一执行者。相比之下，跑之前抢一把
+// 「跑完就释放」的锁只能防止重叠——各副本的定时器相位不同，A 跑完释放锁，
+// B 的定时器几秒后到点照样能再探一次，同一轮窗口仍然是 N 倍探测。
+//
+// 只用于调度器；管理端的「立即检测」直接调 RunCheck，不受窗口门控。
+func (s *ChannelMonitorService) TryClaimScheduledCheck(ctx context.Context, id int64, window time.Duration) (bool, error) {
+	if s == nil || s.repo == nil {
+		return true, nil
+	}
+	if window <= 0 {
+		window = time.Second
+	}
+	now := time.Now()
+	return s.repo.TryClaimCheck(ctx, id, now.Add(-window), now)
+}
 
 // RunCheck 同步触发对一个监控的检测：并发跑 primary + extra 模型，
 // 写历史记录并更新 last_checked_at。返回每个模型的检测结果。

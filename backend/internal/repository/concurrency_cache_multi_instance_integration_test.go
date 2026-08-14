@@ -3,7 +3,9 @@
 package repository
 
 import (
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -29,6 +31,20 @@ func (s *ConcurrencyMultiInstanceSuite) SetupTest() {
 	// 掩盖掉这里真正要验证的「等待计数按实例存活情况取舍」逻辑。
 	// 生产环境该 marker 在 Redis 数据生命周期内只会置位一次，之后不再触发。
 	s.RequireNoError(s.rdb.Set(s.ctx, legacyWaitSweepMarkerKey, "1", 0).Err())
+	// 同理预置注册表建立时间：滚动升级宽限期在一套 Redis 数据的生命周期里只经历一次，
+	// 之后每次启动清扫都是全功能的，这里要验证的正是宽限期之后的语义。
+	// 宽限期本身由 TestCleanupStaleProcessSlots_SkipsDuringRolloutGrace 单独覆盖。
+	s.seedRegistryEstablishedAt(-instanceRegistryRolloutGrace - time.Minute)
+}
+
+// seedRegistryEstablishedAt 把注册表的建立时间设为 now+offset（offset 为负即过去）。
+// 心跳脚本用 SET NX 写 epoch，因此预置值不会被后续心跳覆盖。
+func (s *ConcurrencyMultiInstanceSuite) seedRegistryEstablishedAt(offset time.Duration) {
+	s.T().Helper()
+	now, err := s.cache.redisUnixSeconds(s.ctx)
+	s.RequireNoError(err)
+	established := now + int64(offset.Seconds())
+	s.RequireNoError(s.rdb.Set(s.ctx, instanceRegistryEpochKey, strconv.FormatInt(established, 10), 0).Err())
 }
 
 func (s *ConcurrencyMultiInstanceSuite) slotMembers(key string) []string {
@@ -164,6 +180,51 @@ func (s *ConcurrencyMultiInstanceSuite) TestHeartbeatInstance_RegistersSelfAndEv
 	ttl, err := s.rdb.TTL(s.ctx, instanceRegistryKey).Result()
 	s.RequireNoError(err)
 	require.Positive(s.T(), ttl, "注册表必须带 TTL，避免实例全部下线后永久残留")
+}
+
+// 从不带注册表的版本滚动升级时，仍在服务的旧副本一个都不会出现在注册表里。
+// 这段窗口内「不在注册表里」既可能是已死进程，也可能是还没升级的旧副本，
+// Redis 里无法区分，启动清扫必须整体跳过——否则第一个新副本会把旧副本的
+// 在途槽位与等待计数全部清掉，并发上限被瞬间架空。
+func (s *ConcurrencyMultiInstanceSuite) TestCleanupStaleProcessSlots_SkipsDuringRolloutGrace() {
+	const accountID = int64(4261)
+
+	// 注册表刚刚建立：第一个升级后的副本一分钟前才写下 epoch。
+	s.seedRegistryEstablishedAt(-time.Minute)
+
+	// 旧版本副本正在服务：持有在途槽位与排队请求，但从不上报心跳。
+	s.acquireAccountSlot(accountID, "rlegacy-1")
+	ok, err := s.cache.IncrementAccountWaitCount(s.ctx, accountID, 10)
+	s.RequireNoError(err)
+	require.True(s.T(), ok)
+
+	s.RequireNoError(s.cache.CleanupStaleProcessSlots(s.ctx, "rself"))
+
+	require.Equal(s.T(), []string{"rlegacy-1"}, s.slotMembers(accountSlotKey(accountID)),
+		"升级窗口内不能删除未注册实例的槽位——它可能是还没升级的旧副本")
+	waiting, err := s.cache.GetAccountWaitingCount(s.ctx, accountID)
+	s.RequireNoError(err)
+	require.Equal(s.T(), 1, waiting, "升级窗口内等待计数同样不能清零")
+}
+
+// 注册表建立时间只写一次：它是「注册表从什么时候开始生效」的唯一凭据，
+// 每次心跳都改写的话宽限期永远不会结束，启动清扫就再也不会生效。
+func (s *ConcurrencyMultiInstanceSuite) TestHeartbeatInstance_StampsRegistryEpochOnce() {
+	s.RequireNoError(s.rdb.Del(s.ctx, instanceRegistryEpochKey).Err())
+
+	s.RequireNoError(s.cache.HeartbeatInstance(s.ctx, "rself"))
+	first, err := s.rdb.Get(s.ctx, instanceRegistryEpochKey).Int64()
+	s.RequireNoError(err)
+	require.Positive(s.T(), first)
+
+	s.RequireNoError(s.cache.HeartbeatInstance(s.ctx, "rpeer"))
+	second, err := s.rdb.Get(s.ctx, instanceRegistryEpochKey).Int64()
+	s.RequireNoError(err)
+	require.Equal(s.T(), first, second, "后续心跳不得改写注册表建立时间")
+
+	ttl, err := s.rdb.TTL(s.ctx, instanceRegistryEpochKey).Result()
+	s.RequireNoError(err)
+	require.Negative(s.T(), ttl, "建立时间不能过期，否则宽限期会周期性复活")
 }
 
 // 无法解析出进程前缀的成员（不含分隔符）不参与归属判定，必须保留，

@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,10 +187,109 @@ func TestBackupService_RecoverStaleRecordsKeepsPeerRecordWithUnparsableStartedAt
 	require.Zero(t, repo.setCalls.Load(), "时间无法解析时不得回收同伴记录")
 }
 
+// 恢复必须按自己的执行者和开始时间判活：一份几小时前做的备份现在正被同伴恢复时，
+// 拿备份的 StartedAt 去判，会把在跑的恢复直接标记成 failed。
+func TestBackupService_RecoverStaleRecordsKeepsPeerRunningRestoreOfOldBackup(t *testing.T) {
+	now := time.Now()
+	repo := &stubBackupSettingRepo{value: backupRecordsJSON(t, []BackupRecord{{
+		ID:                     "old-backup-being-restored",
+		Status:                 "completed",
+		OwnerInstanceID:        "peer-instance",
+		StartedAt:              now.Add(-3 * time.Hour).Format(time.RFC3339), // 备份是三小时前做的
+		RestoreStatus:          "running",
+		RestoreOwnerInstanceID: "peer-instance",
+		RestoreStartedAt:       now.Format(time.RFC3339), // 恢复刚刚开始
+	}})}
+	svc := newRecoveryBackupService(repo)
+
+	svc.recoverStaleRecords()
+
+	require.Zero(t, repo.setCalls.Load(), "同伴正在跑的恢复不得被标记为 failed")
+}
+
+// 同伴的恢复挂了很久同样要回收，否则记录永远停在 running。
+func TestBackupService_RecoverStaleRecordsReclaimsLongDeadPeerRestore(t *testing.T) {
+	now := time.Now()
+	repo := &stubBackupSettingRepo{value: backupRecordsJSON(t, []BackupRecord{{
+		ID:                     "dead-peer-restore",
+		Status:                 "completed",
+		OwnerInstanceID:        "peer-instance",
+		StartedAt:              now.Add(-3 * time.Hour).Format(time.RFC3339),
+		RestoreStatus:          "running",
+		RestoreOwnerInstanceID: "peer-instance",
+		RestoreStartedAt:       now.Add(-backupPeerRecordStaleAfter - time.Hour).Format(time.RFC3339),
+	}})}
+	svc := newRecoveryBackupService(repo)
+
+	svc.recoverStaleRecords()
+
+	require.Positive(t, repo.setCalls.Load(), "长期未收尾的同伴恢复应被回收")
+}
+
+// 升级前写下的记录没有恢复执行者字段，沿用旧语义立即回收。
+func TestBackupService_RecoverStaleRecordsReclaimsLegacyRunningRestore(t *testing.T) {
+	repo := &stubBackupSettingRepo{value: backupRecordsJSON(t, []BackupRecord{{
+		ID:            "legacy-restore",
+		Status:        "completed",
+		StartedAt:     time.Now().Format(time.RFC3339),
+		RestoreStatus: "running",
+	}})}
+	svc := newRecoveryBackupService(repo)
+
+	svc.recoverStaleRecords()
+
+	require.Positive(t, repo.setCalls.Load(), "无恢复 owner 的历史记录应立即回收")
+}
+
+// 周期复检是跨实例的清扫，必须选主：备份记录是 settings 里的单行 JSON，
+// 多个实例同时读-改-写会互相覆盖，还会对同一批 S3 对象重复发删除。
+func TestBackupService_RecoverySweepSkipsWhenPeerHoldsLeaderLock(t *testing.T) {
+	lock := &fakeLeaderLockCache{}
+	_, err := lock.TryAcquireLeaderLock(context.Background(), backupRecoveryLeaderLockKey, "peer-instance", time.Minute)
+	require.NoError(t, err)
+
+	repo := &stubBackupSettingRepo{value: backupRecordsJSON(t, []BackupRecord{{
+		ID:        "legacy-backup",
+		Status:    "running",
+		StartedAt: time.Now().Format(time.RFC3339),
+	}})}
+	svc := newRecoveryBackupService(repo)
+	svc.SetLeaderLock(lock, nil)
+
+	svc.recoverStaleRecordsAsLeader()
+
+	require.Zero(t, repo.getCalls.Load(), "同伴持锁时不得读取备份记录")
+	require.Equal(t, "peer-instance", lock.heldBy(backupRecoveryLeaderLockKey), "不得抢走同伴的锁")
+}
+
+// 拿到锁时正常复检并释放锁：阈值到达的那一刻通常没有任何启动事件，
+// 没有这一轮复检，记录会永远卡在 running，S3 产物也永远没人清理。
+func TestBackupService_RecoverySweepRunsAndReleasesLockWhenLeader(t *testing.T) {
+	lock := &fakeLeaderLockCache{}
+	repo := &stubBackupSettingRepo{value: backupRecordsJSON(t, []BackupRecord{{
+		ID:              "dead-peer-backup",
+		Status:          "running",
+		OwnerInstanceID: "peer-instance",
+		StartedAt:       time.Now().Add(-backupPeerRecordStaleAfter - time.Hour).Format(time.RFC3339),
+	}})}
+	svc := newRecoveryBackupService(repo)
+	svc.SetLeaderLock(lock, nil)
+
+	svc.recoverStaleRecordsAsLeader()
+
+	require.Positive(t, repo.setCalls.Load(), "leader 必须真正执行复检回收")
+	require.Empty(t, lock.heldBy(backupRecoveryLeaderLockKey), "复检结束必须释放锁")
+}
+
 // ── ChannelMonitorRunner ──────────────────────────────────────────────────────
 
+// monitorTask 构造一个等价于 Schedule 出来的调度任务，供直接驱动 runOne 使用。
+func monitorTask(id int64, name string, interval time.Duration) *scheduledMonitor {
+	return &scheduledMonitor{id: id, name: name, interval: interval}
+}
+
 // 同伴实例持有某个 monitor 的 leader lock 时，本实例这一次触发必须跳过。
-// 否则同一个监控会被 N 个副本各探测一次，上游压力和历史记录都放大 N 倍。
+// 这把锁只防重叠：同一轮窗口的去重由 TryClaimScheduledCheck 负责。
 func TestChannelMonitorRunner_SkipsCheckWhenPeerHoldsLeaderLock(t *testing.T) {
 	const monitorID = int64(77)
 
@@ -201,9 +301,10 @@ func TestChannelMonitorRunner_SkipsCheckWhenPeerHoldsLeaderLock(t *testing.T) {
 	runner := newRunnerForTest(svc)
 	runner.SetLeaderLock(lock, nil)
 
-	runner.runOne(monitorID, "peer-owned")
+	runner.runOne(monitorTask(monitorID, "peer-owned", time.Minute))
 
 	require.Zero(t, svc.runCount.Load(), "同伴持锁时不得发起检测")
+	require.Zero(t, svc.claimCount.Load(), "没抢到锁就不该推进触发窗口——白吃掉一轮探测")
 	require.Equal(t, "peer-instance", lock.heldBy(channelMonitorFireLeaderLockKey(monitorID)), "不得抢走同伴的锁")
 }
 
@@ -216,7 +317,7 @@ func TestChannelMonitorRunner_RunsAndReleasesLockWhenLeader(t *testing.T) {
 	runner := newRunnerForTest(svc)
 	runner.SetLeaderLock(lock, nil)
 
-	runner.runOne(monitorID, "self-owned")
+	runner.runOne(monitorTask(monitorID, "self-owned", time.Minute))
 
 	require.EqualValues(t, 1, svc.runCount.Load(), "leader 必须真正执行检测")
 	require.Empty(t, lock.heldBy(channelMonitorFireLeaderLockKey(monitorID)), "检测结束必须释放锁")
@@ -233,7 +334,63 @@ func TestChannelMonitorRunner_LeaderLockIsPerMonitor(t *testing.T) {
 	runner := newRunnerForTest(svc)
 	runner.SetLeaderLock(lock, nil)
 
-	runner.runOne(102, "other-monitor")
+	runner.runOne(monitorTask(102, "other-monitor", time.Minute))
 
 	require.EqualValues(t, 1, svc.runCount.Load(), "同伴持有的是另一个 monitor 的锁，不应阻塞本 monitor")
+}
+
+// sharedWindowMonitorSvc 用一份共享的 last-checked 时间模拟数据库上的窗口声明，
+// 让两个副本像生产一样竞争同一行 channel_monitors。
+type sharedWindowMonitorSvc struct {
+	mu          sync.Mutex
+	lastChecked time.Time
+	runs        atomic.Int64
+	now         func() time.Time
+}
+
+func (s *sharedWindowMonitorSvc) ListEnabledMonitors(context.Context) ([]*ChannelMonitor, error) {
+	return nil, nil
+}
+
+func (s *sharedWindowMonitorSvc) RunCheck(_ context.Context, _ int64) ([]*CheckResult, error) {
+	s.runs.Add(1)
+	return nil, nil
+}
+
+func (s *sharedWindowMonitorSvc) TryClaimScheduledCheck(_ context.Context, _ int64, window time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	if !s.lastChecked.IsZero() && now.Sub(s.lastChecked) < window {
+		return false, nil
+	}
+	s.lastChecked = now
+	return true, nil
+}
+
+// 各副本的定时器互相独立，相位差是常态：A 跑完释放锁，几秒后 B 的定时器到点，
+// 于是同一轮里同一个上游被探测两次——锁只挡重叠，挡不住这个。
+// 触发窗口声明才是这件事的闸门。
+func TestChannelMonitorRunner_WindowClaimStopsStaggeredPeerProbes(t *testing.T) {
+	clock := time.Now()
+	svc := &sharedWindowMonitorSvc{now: func() time.Time { return clock }}
+	lock := &fakeLeaderLockCache{}
+
+	replicaA := newRunnerForTest(svc)
+	replicaA.SetLeaderLock(lock, nil)
+	replicaB := newRunnerForTest(svc)
+	replicaB.SetLeaderLock(lock, nil)
+
+	task := monitorTask(79, "m79", 5*time.Minute)
+
+	replicaA.runOne(task)
+	clock = clock.Add(5 * time.Second) // B 的定时器晚 5 秒到点，此时锁早已释放
+	replicaB.runOne(task)
+
+	require.EqualValues(t, 1, svc.runs.Load(), "同一轮触发窗口内只能有一个副本真正探测")
+
+	clock = clock.Add(5 * time.Minute) // 进入下一轮窗口
+	replicaB.runOne(task)
+
+	require.EqualValues(t, 2, svc.runs.Load(), "窗口过去后必须继续按节奏探测，不能被永久卡住")
 }

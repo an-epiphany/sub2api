@@ -36,6 +36,20 @@ func (s *ConcurrencyCacheSuite) SetupTest() {
 	s.IntegrationRedisSuite.SetupTest()
 	s.rawCache = NewConcurrencyCache(s.rdb, testSlotTTLMinutes, int(testSlotTTL.Seconds())).(*concurrencyCache)
 	s.cache = s.rawCache
+	// 每个测试都拿到全新的 Redis 命名空间，注册表也就是全新的，启动清扫会落进
+	// 滚动升级宽限期而整体跳过。这里把建立时间前移，让本套件验证的是宽限期之后的
+	// 稳态语义；宽限期本身由 ConcurrencyMultiInstanceSuite 单独覆盖。
+	s.seedEstablishedInstanceRegistry()
+}
+
+// seedEstablishedInstanceRegistry 把注册表建立时间前移到滚动升级宽限期之外，
+// 让启动清扫按「所有存活实例都会上报心跳」的稳态语义执行。
+func (s *ConcurrencyCacheSuite) seedEstablishedInstanceRegistry() {
+	s.T().Helper()
+	now, err := s.rawCache.redisUnixSeconds(s.ctx)
+	require.NoError(s.T(), err)
+	established := now - int64(instanceRegistryRolloutGrace.Seconds()) - 60
+	require.NoError(s.T(), s.rdb.Set(s.ctx, instanceRegistryEpochKey, strconv.FormatInt(established, 10), 0).Err())
 }
 
 type apiKeyConcurrencyCacheForTest interface {

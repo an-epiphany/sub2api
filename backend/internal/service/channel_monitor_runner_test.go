@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,20 @@ type stubMonitorSvc struct {
 	runErr     error
 	listErr    error
 	runHoldFor time.Duration // RunCheck 内额外阻塞的时长，用来测试 Stop 等待行为
+
+	claimCount  atomic.Int64
+	claimDenied bool  // true = 窗口已被同伴副本占用
+	claimErr    error // 非空 = 声明窗口时出错
+	claimWindow atomic.Int64
+}
+
+func (s *stubMonitorSvc) TryClaimScheduledCheck(_ context.Context, _ int64, window time.Duration) (bool, error) {
+	s.claimCount.Add(1)
+	s.claimWindow.Store(int64(window))
+	if s.claimErr != nil {
+		return false, s.claimErr
+	}
+	return !s.claimDenied, nil
 }
 
 func (s *stubMonitorSvc) ListEnabledMonitors(_ context.Context) ([]*ChannelMonitor, error) {
@@ -356,5 +371,60 @@ func stoppedWithin(t *testing.T, r *ChannelMonitorRunner, timeout time.Duration)
 	case <-done:
 	case <-time.After(timeout):
 		t.Fatalf("Stop did not return within %s — leaked goroutine?", timeout)
+	}
+}
+
+// 各副本的定时器相位不同，「跑之前抢锁、跑完释放」只挡得住重叠：A 跑完释放锁，
+// 几秒后 B 的定时器到点照样能再探一次。同一轮触发窗口只探一次这件事，
+// 由数据库上的窗口声明决定——声明失败就必须跳过，绝不能照旧打上游。
+func TestRunOne_SkipsProbeWhenWindowAlreadyClaimed(t *testing.T) {
+	svc := &stubMonitorSvc{runCalled: make(chan int64, 4), claimDenied: true}
+	r := newRunnerForTest(svc)
+	r.Start()
+	t.Cleanup(r.Stop)
+
+	r.Schedule(&ChannelMonitor{ID: 11, Name: "m11", Enabled: true, IntervalSeconds: 60})
+
+	waitFor(t, 2*time.Second, "expected a window claim attempt", func() bool {
+		return svc.claimCount.Load() >= 1
+	})
+	if got := svc.runCount.Load(); got != 0 {
+		t.Fatalf("window was claimed by a peer, expected 0 probes, got %d", got)
+	}
+}
+
+// 声明窗口本身出错（数据库不可用）时同样跳过：此时探测结果也写不进历史，
+// 照旧探测只会退回「每个副本各探一次」的重复计费。
+func TestRunOne_SkipsProbeWhenClaimFails(t *testing.T) {
+	svc := &stubMonitorSvc{runCalled: make(chan int64, 4), claimErr: errors.New("db unavailable")}
+	r := newRunnerForTest(svc)
+	r.Start()
+	t.Cleanup(r.Stop)
+
+	r.Schedule(&ChannelMonitor{ID: 12, Name: "m12", Enabled: true, IntervalSeconds: 60})
+
+	waitFor(t, 2*time.Second, "expected a window claim attempt", func() bool {
+		return svc.claimCount.Load() >= 1
+	})
+	if got := svc.runCount.Load(); got != 0 {
+		t.Fatalf("claim failed, expected 0 probes, got %d", got)
+	}
+}
+
+// 窗口长度取 interval - jitter：单个副本可能产生的最短合法间隔。
+// 取满 interval 会把带 jitter 的正常触发也挡掉，让节奏被拉长整整一轮。
+func TestRunOne_ClaimWindowIsIntervalMinusJitter(t *testing.T) {
+	svc := &stubMonitorSvc{runCalled: make(chan int64, 4)}
+	r := newRunnerForTest(svc)
+	r.Start()
+	t.Cleanup(r.Stop)
+
+	r.Schedule(&ChannelMonitor{ID: 13, Name: "m13", Enabled: true, IntervalSeconds: 60, JitterSeconds: 10})
+
+	waitFor(t, 2*time.Second, "expected a window claim attempt", func() bool {
+		return svc.claimCount.Load() >= 1
+	})
+	if got := time.Duration(svc.claimWindow.Load()); got != 50*time.Second {
+		t.Fatalf("expected claim window 50s (interval 60s - jitter 10s), got %s", got)
 	}
 }

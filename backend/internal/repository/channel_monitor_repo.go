@@ -208,6 +208,34 @@ func (r *channelMonitorRepository) ListEnabled(ctx context.Context) ([]*service.
 	return out, nil
 }
 
+// TryClaimCheck 原子地把 last_checked_at 推进到 claimedAt，条件是监控仍处于启用状态，
+// 且 last_checked_at 早于 notCheckedSince（或从未检测过）。返回是否声明成功。
+//
+// 多副本下每个副本各有一份定时器且相位互不相同，「跑之前抢锁、跑完释放」只挡得住重叠，
+// 挡不住同一轮窗口被探测 N 次——每一次都是一次真实的上游计费请求。last_checked_at
+// 是这件事的所有者，交给数据库用一条 UPDATE 直接裁决出唯一的执行者。
+//
+// enabled 也写进条件：CRUD 钩子只在处理该请求的副本上生效，其余副本要到重启才知道
+// 监控被停用；条件里带上它，停用/删除之后同伴残留的定时器自然就探不动了。
+func (r *channelMonitorRepository) TryClaimCheck(ctx context.Context, id int64, notCheckedSince, claimedAt time.Time) (bool, error) {
+	client := clientFromContext(ctx, r.client)
+	affected, err := client.ChannelMonitor.Update().
+		Where(
+			channelmonitor.IDEQ(id),
+			channelmonitor.EnabledEQ(true),
+			channelmonitor.Or(
+				channelmonitor.LastCheckedAtIsNil(),
+				channelmonitor.LastCheckedAtLT(notCheckedSince),
+			),
+		).
+		SetLastCheckedAt(claimedAt).
+		Save(ctx)
+	if err != nil {
+		return false, translatePersistenceError(err, service.ErrChannelMonitorNotFound, nil)
+	}
+	return affected > 0, nil
+}
+
 func (r *channelMonitorRepository) MarkChecked(ctx context.Context, id int64, checkedAt time.Time) error {
 	client := clientFromContext(ctx, r.client)
 	if err := client.ChannelMonitor.UpdateOneID(id).

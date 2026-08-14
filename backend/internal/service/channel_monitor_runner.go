@@ -14,9 +14,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// channelMonitorFireLeaderLockKey 按 monitor 维度做跨实例互斥：同一个监控在一次
-// 触发窗口内只允许一个副本真正探测，不同监控仍可分散到不同副本上并行执行。
-// 用整体锁会把所有监控串行化到单个副本，白白浪费其余副本的探测能力。
+// channelMonitorFireLeaderLockKey 按 monitor 维度做跨实例互斥，防止同一个监控被两个
+// 副本同时探测；不同监控仍可分散到不同副本上并行执行。用整体锁会把所有监控串行化到
+// 单个副本，白白浪费其余副本的探测能力。
+//
+// 这把锁只负责「不重叠」。「同一轮触发窗口只探一次」由 TryClaimScheduledCheck 在
+// 数据库上裁决——锁跑完就释放，挡不住各副本定时器相位差造成的重复探测。
 func channelMonitorFireLeaderLockKey(monitorID int64) string {
 	return fmt.Sprintf("channel_monitor:fire:%d", monitorID)
 }
@@ -44,6 +47,8 @@ type MonitorScheduler interface {
 type monitorRunnerSvc interface {
 	ListEnabledMonitors(ctx context.Context) ([]*ChannelMonitor, error)
 	RunCheck(ctx context.Context, id int64) ([]*CheckResult, error)
+	// TryClaimScheduledCheck 声明本轮触发窗口，跨副本只会有一个声明成功。
+	TryClaimScheduledCheck(ctx context.Context, id int64, window time.Duration) (bool, error)
 }
 
 // ChannelMonitorRunner 渠道监控调度器。
@@ -75,8 +80,9 @@ type ChannelMonitorRunner struct {
 
 	// inFlight 跟踪正在执行的 monitor.ID。fire 调度前会检查避免重复提交，
 	// 防止单次检测耗时 > interval 时同一 monitor 被并发执行。
-	// 注意它只是进程内闸门：多副本下每个 Pod 各有一份，挡不住跨实例重复探测，
-	// 那一层由 runOne 里的 leader lock 负责。
+	// 注意它只是进程内闸门：多副本下每个 Pod 各有一份，挡不住跨实例重复探测。
+	// 那一层由 runOne 里的两道门负责——leader lock 防重叠，
+	// TryClaimScheduledCheck 防「同一轮窗口被 N 个副本各探一次」。
 	inFlight   map[int64]struct{}
 	inFlightMu sync.Mutex
 
@@ -101,6 +107,22 @@ type scheduledMonitor struct {
 	interval time.Duration
 	jitter   time.Duration // 每轮 ± [0, jitter] 的均匀随机偏移；0 = 固定间隔
 	cancel   context.CancelFunc
+}
+
+// claimWindow 是一轮触发窗口的长度：同一个监控在窗口内只允许被探测一次。
+//
+// 取 interval - jitter，也就是单个副本可能产生的最短合法间隔——比这更短的触发
+// 必然来自另一个副本的相位差，应当被窗口挡掉。
+//
+// 由此得到的集群节奏是「相邻两次探测至少相隔 window，谁的定时器先到点谁探」，
+// 平均间隔会略大于 interval（无 jitter、N 个副本时约 interval + interval/N）。
+// 用重复探测换这点节奏精度不划算：每次重复探测都是一次真实的上游计费请求。
+func (t *scheduledMonitor) claimWindow() time.Duration {
+	window := t.interval - t.jitter
+	if window < time.Second {
+		window = time.Second
+	}
+	return window
 }
 
 // nextDelay 计算下一次触发的等待时长：interval ± [0, jitter] 的均匀随机偏移。
@@ -299,7 +321,7 @@ func (r *ChannelMonitorRunner) fire(ctx context.Context, task *scheduledMonitor)
 		return
 	}
 	if _, ok := r.pool.TrySubmit(func() {
-		r.runOne(task.id, task.name)
+		r.runOne(task)
 	}); !ok {
 		// 池满：丢弃本次检测，但必须释放已占用的 inFlight 槽，否则该 monitor 会被永久卡住。
 		r.releaseInFlight(task.id)
@@ -329,7 +351,8 @@ func (r *ChannelMonitorRunner) releaseInFlight(id int64) {
 
 // runOne 执行单个监控的检测。普通错误只记日志；API key 解密失败会撤销任务。
 // 任务结束时（含 panic recover）必须释放 in-flight 槽。
-func (r *ChannelMonitorRunner) runOne(id int64, name string) {
+func (r *ChannelMonitorRunner) runOne(task *scheduledMonitor) {
+	id, name := task.id, task.name
 	ctx, cancel := context.WithTimeout(context.Background(), monitorRequestTimeout+monitorPingTimeout+monitorRunOneBuffer)
 	defer cancel()
 
@@ -354,6 +377,22 @@ func (r *ChannelMonitorRunner) runOne(id int64, name string) {
 		return
 	}
 	defer release()
+
+	// 先抢锁再声明窗口：顺序反过来的话，窗口已被本副本推进、探测却因为同伴还在跑
+	// 而没有发生，等于白白吃掉一轮。
+	claimed, err := r.svc.TryClaimScheduledCheck(ctx, id, task.claimWindow())
+	if err != nil {
+		// 判定不了就不探测。RunCheck 本身也要读写数据库，此时探了也存不下结果，
+		// 反而会退回「每个副本各探一次」的重复计费。
+		slog.Warn("channel_monitor: claim check window failed, skip this round",
+			"monitor_id", id, "name", name, "error", err)
+		return
+	}
+	if !claimed {
+		slog.Debug("channel_monitor: skip, this window was already checked by another instance",
+			"monitor_id", id, "name", name)
+		return
+	}
 
 	if _, err := r.svc.RunCheck(ctx, id); err != nil {
 		if errors.Is(err, ErrChannelMonitorAPIKeyDecryptFailed) {

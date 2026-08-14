@@ -397,8 +397,8 @@ func (s *ChannelService) InvalidateCache() {
 	s.invalidateCache()
 }
 
-// invalidateCache 失效本快照并通知其余副本。
-// 广播成功时本地失效由订阅回调完成；未接入广播通道时直接本地失效。
+// invalidateCache 同步失效本副本快照，并通知其余副本失效各自的那一份。
+// 未接入广播通道时（单实例部署、单元测试）只做本地失效。
 func (s *ChannelService) invalidateCache() {
 	if s.snapshotInvalidator != nil {
 		s.snapshotInvalidator.InvalidateAndBroadcast(context.Background())

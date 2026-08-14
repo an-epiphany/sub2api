@@ -31,9 +31,14 @@ func newFakeSnapshotInvalidationCache() *fakeSnapshotInvalidationCache {
 	}
 }
 
-func (f *fakeSnapshotInvalidationCache) PublishSnapshotInvalidation(_ context.Context, topic string) error {
+func (f *fakeSnapshotInvalidationCache) PublishSnapshotInvalidation(ctx context.Context, topic string) error {
 	if f.pubErr != nil {
 		return f.pubErr
+	}
+	// go-redis 会在 ctx 已取消时直接让命令失败，这里照抄该行为，
+	// 便于验证广播不受调用方请求 ctx 取消的影响。
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	f.mu.Lock()
 	f.published[topic]++
@@ -87,7 +92,39 @@ func TestSnapshotInvalidator_BroadcastReachesPeersWithoutEchoing(t *testing.T) {
 
 	require.EqualValues(t, 1, cache.publishCount("channel"), "一次失效只能广播一次")
 	require.EqualValues(t, 1, peerInvalidations.Load(), "同伴副本必须收到失效通知")
-	require.EqualValues(t, 1, selfInvalidations.Load(), "本副本也要失效（订阅端统一处理，不必额外调用）")
+	// 本副本已经在 InvalidateAndBroadcast 里同步失效过一次，投递回来的那一份只是幂等重复。
+	require.GreaterOrEqual(t, selfInvalidations.Load(), int64(1), "本副本必须失效")
+}
+
+// PUBLISH 成功不等于本进程已经失效：Pub/Sub 不保证投递，订阅正在启动或断线重连时
+// 消息会直接丢失。写入方必须自己同步失效，否则它手里的快照会陈旧到 TTL 过期。
+func TestSnapshotInvalidator_InvalidatesLocallyWhenDeliveryIsLost(t *testing.T) {
+	cache := newFakeSnapshotInvalidationCache() // 没有任何订阅者：消息发出去即丢失
+
+	var invalidations atomic.Int64
+	inv := NewSnapshotInvalidator(cache, "channel", func() { invalidations.Add(1) })
+
+	inv.InvalidateAndBroadcast(context.Background())
+
+	require.EqualValues(t, 1, cache.publishCount("channel"))
+	require.EqualValues(t, 1, invalidations.Load(),
+		"广播只负责通知同伴，本副本的失效必须在返回前同步完成")
+}
+
+// 广播不能跟着调用方的请求 ctx 一起被取消：数据库写入已经落盘，
+// 此时放弃广播等于让同伴实例永远错过这次变更。
+func TestSnapshotInvalidator_BroadcastSurvivesCallerContextCancel(t *testing.T) {
+	cache := newFakeSnapshotInvalidationCache()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 写库成功后请求 ctx 才超时/取消，是线上最常见的顺序
+
+	var invalidations atomic.Int64
+	inv := NewSnapshotInvalidator(cache, "settings", func() { invalidations.Add(1) })
+
+	inv.InvalidateAndBroadcast(ctx)
+
+	require.EqualValues(t, 1, cache.publishCount("settings"), "请求 ctx 取消不应吞掉广播")
+	require.EqualValues(t, 1, invalidations.Load())
 }
 
 // Redis 广播失败时必须仍然完成本地失效：宁可只有本副本生效，也不能连本地都不刷新。

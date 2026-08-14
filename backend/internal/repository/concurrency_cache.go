@@ -67,7 +67,12 @@ const (
 	// 单实例时代用「成员前缀 != 本进程前缀」近似这个判据，多副本下该近似失效——
 	// 同伴 Pod 的在途槽位前缀同样 != 本进程前缀，会被误删。存活与否这个事实
 	// 只有 Redis 看得到（它是唯一能观察到全部实例的地方），因此把它显式建模在这里。
-	instanceRegistryKey = "concurrency:instances"
+	//
+	// 键名带 hash tag，保证注册表与其 epoch 键落在同一个 slot，心跳脚本可以一次改两个键。
+	instanceRegistryKey = "concurrency:{instances}"
+	// instanceRegistryEpochKey 记录注册表第一次建立的 Redis 时间（秒），只写一次、不过期。
+	// 它回答的是「这套 Redis 上的注册表启用多久了」，用于判断是否还处于滚动升级窗口。
+	instanceRegistryEpochKey = "concurrency:{instances}:epoch"
 )
 
 // instanceHeartbeatInterval 是实例心跳间隔，instanceHeartbeatStaleAfter 是判定
@@ -75,6 +80,19 @@ const (
 const (
 	instanceHeartbeatInterval   = 20 * time.Second
 	instanceHeartbeatStaleAfter = 90 * time.Second
+
+	// instanceRegistryRolloutGrace 是注册表刚建立后的宽限期，期间不做破坏性启动清扫。
+	//
+	// 注册表能证明「谁在上报心跳」，但证明不了「没有别人」。从不带注册表的旧版本滚动升级
+	// 时，仍在服务的旧副本一个都不会出现在注册表里：第一个新副本看到「只有我」，会把旧副本
+	// 的在途槽位与等待计数全部清掉——正是本次要修的那个故障，只是挪到了升级窗口里发生。
+	// 「所有存活进程都会上报心跳」这个前提，只有在注册表建立、且旧版本副本全部退场之后才
+	// 成立；而「升级有没有结束」这件事在编排层，进程内看不到，因此只能用时间兜底。
+	//
+	// 代价可控：宽限期内崩溃残留改由 acquire 路径的 ZREMRANGEBYSCORE 在一个 slot TTL 内
+	// 按分数回收（启动清扫本来也只是把这件事提前）。宽限期在一套 Redis 数据的生命周期里
+	// 只经历一次，此后每次重启/扩容都是全功能清扫。
+	instanceRegistryRolloutGrace = 30 * time.Minute
 )
 
 var (
@@ -381,20 +399,29 @@ var (
 		return {removed, remaining}
 	`)
 
-	// instanceHeartbeatScript 注册/续期本实例并剔除心跳超时的实例，返回当前存活实例前缀列表。
+	// instanceHeartbeatScript 注册/续期本实例并剔除心跳超时的实例，
+	// 返回 {当前时间, 注册表建立时间, 存活实例前缀列表}。
 	// 心跳与读取存活集合合并为一次往返：调用方拿到的集合必然已包含自己，
 	// 因此启动清扫绝不会因为「还没来得及注册」而把自己的槽位删掉。
-	// KEYS[1] 是注册表键，ARGV[1] 是本实例前缀，ARGV[2] 是判定实例已死的秒数阈值。
+	//
+	// epoch 用 SET NX 落一次就不再改写，也不设过期：它是「注册表从什么时候开始生效」的
+	// 唯一凭据，启动清扫据此判断当前是否仍处于滚动升级窗口（此时可能存在不上报心跳的旧副本）。
+	// KEYS[1] 是注册表键，KEYS[2] 是 epoch 键；ARGV[1] 是本实例前缀，ARGV[2] 是判定实例已死的秒数阈值。
 	instanceHeartbeatScript = redis.NewScript(`
 		redis.replicate_commands()
 		local key = KEYS[1]
+		local epochKey = KEYS[2]
 		local self = ARGV[1]
 		local staleAfter = tonumber(ARGV[2])
 		local now = tonumber(redis.call('TIME')[1])
 		redis.call('ZADD', key, now, self)
 		redis.call('ZREMRANGEBYSCORE', key, '-inf', now - staleAfter)
 		redis.call('EXPIRE', key, staleAfter * 4)
-		return redis.call('ZRANGE', key, 0, -1)
+		redis.call('SET', epochKey, now, 'NX')
+		-- or 0：epoch 解析不出数值时也要返回一个数，Lua 表里出现 nil 会把返回数组
+		-- 从那里截断，调用方拿到的就成了「回包格式错误」而不是「建立时间未知」。
+		local epoch = tonumber(redis.call('GET', epochKey)) or 0
+		return {now, epoch, redis.call('ZRANGE', key, 0, -1)}
 	`)
 )
 
@@ -1191,30 +1218,56 @@ func (c *concurrencyCache) InstanceHeartbeatInterval() time.Duration {
 	return instanceHeartbeatInterval
 }
 
-// refreshInstanceRegistry 上报本实例心跳并返回当前存活的实例前缀集合（必然含自己）。
-func (c *concurrencyCache) refreshInstanceRegistry(ctx context.Context, requestPrefix string) ([]string, error) {
+// instanceRegistrySnapshot 是一次心跳往返看到的注册表状态。
+type instanceRegistrySnapshot struct {
+	// now 是 Redis 服务器当前时间（Unix 秒）。
+	now int64
+	// establishedAt 是注册表第一次建立的时间（Unix 秒）；0 表示未知。
+	establishedAt int64
+	// livePrefixes 是当前仍在上报心跳的实例前缀（必然含自己）。
+	livePrefixes []string
+}
+
+// withinRolloutGrace 判断注册表是否仍处于「可能存在不上报心跳的旧副本」的窗口。
+// 拿不到建立时间时按仍在窗口内处理：宁可少回收，也不能误删同伴的在途槽位。
+func (s instanceRegistrySnapshot) withinRolloutGrace() bool {
+	if s.now <= 0 || s.establishedAt <= 0 {
+		return true
+	}
+	return s.now-s.establishedAt < int64(instanceRegistryRolloutGrace.Seconds())
+}
+
+// refreshInstanceRegistry 上报本实例心跳并返回注册表快照。
+func (c *concurrencyCache) refreshInstanceRegistry(ctx context.Context, requestPrefix string) (instanceRegistrySnapshot, error) {
+	var snapshot instanceRegistrySnapshot
 	if c == nil || c.rdb == nil || requestPrefix == "" {
-		return nil, nil
+		return snapshot, nil
 	}
 	raw, err := instanceHeartbeatScript.Run(
 		ctx, c.rdb,
-		[]string{instanceRegistryKey},
+		[]string{instanceRegistryKey, instanceRegistryEpochKey},
 		requestPrefix, int64(instanceHeartbeatStaleAfter.Seconds()),
 	).Result()
 	if err != nil {
-		return nil, fmt.Errorf("refresh instance registry: %w", err)
+		return snapshot, fmt.Errorf("refresh instance registry: %w", err)
 	}
-	entries, ok := raw.([]any)
+	reply, ok := raw.([]any)
+	if !ok || len(reply) != 3 {
+		return snapshot, fmt.Errorf("refresh instance registry: unexpected reply %T", raw)
+	}
+	snapshot.now, _ = reply[0].(int64)
+	snapshot.establishedAt, _ = reply[1].(int64)
+	entries, ok := reply[2].([]any)
 	if !ok {
-		return nil, fmt.Errorf("refresh instance registry: unexpected reply type %T", raw)
+		return snapshot, fmt.Errorf("refresh instance registry: unexpected member list %T", reply[2])
 	}
-	prefixes := make([]string, 0, len(entries))
+	snapshot.livePrefixes = make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if prefix, ok := entry.(string); ok && prefix != "" {
-			prefixes = append(prefixes, prefix)
+			snapshot.livePrefixes = append(snapshot.livePrefixes, prefix)
 		}
 	}
-	return prefixes, nil
+	return snapshot, nil
 }
 
 // CleanupStaleProcessSlots 启动时回收「持有进程已死」的槽位。
@@ -1227,14 +1280,25 @@ func (c *concurrencyCache) refreshInstanceRegistry(ctx context.Context, requestP
 // 这样同伴 Pod 的在途槽位不会被误删，而崩溃进程的残留仍会在其心跳超时后被回收
 // （最坏延迟为 instanceHeartbeatStaleAfter；若期间无人重启，则由 acquire 路径上的
 // ZREMRANGEBYSCORE 在一个 slot TTL 内兜底）。
+//
+// 注册表刚建立时（见 instanceRegistryRolloutGrace）整个清扫直接跳过：那段窗口里
+// 「不在注册表里」既可能是已死进程，也可能是还没升级、根本不上报心跳的旧副本，
+// 两者在 Redis 里无法区分，只能都不动。
 func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error {
 	if activeRequestPrefix == "" {
 		return nil
 	}
-	livePrefixes, err := c.refreshInstanceRegistry(ctx, activeRequestPrefix)
+	registry, err := c.refreshInstanceRegistry(ctx, activeRequestPrefix)
 	if err != nil {
 		return err
 	}
+	if registry.withinRolloutGrace() {
+		logger.LegacyPrintf("repository.concurrency",
+			"Info: instance registry younger than the %s rollout grace; skipping startup slot cleanup (stale slots fall back to score-based expiry within one slot TTL)",
+			instanceRegistryRolloutGrace)
+		return nil
+	}
+	livePrefixes := registry.livePrefixes
 	if len(livePrefixes) == 0 {
 		// 注册表不可用时宁可不清理，也不能退回「删掉所有非本进程成员」的旧语义。
 		livePrefixes = []string{activeRequestPrefix}

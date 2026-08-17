@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -58,6 +59,40 @@ const (
 	// 一次性迁移 marker：活跃索引机制上线前遗留的等待计数键无法被索引发现，
 	// 且有流量时 TTL 会被不断刷新，必须清扫一次。marker 存在即代表已完成。
 	legacyWaitSweepMarkerKey = "concurrency:startup:legacy_wait_sweep:v1"
+
+	// instanceRegistryKey 是存活实例注册表：ZSET member=进程 requestID 前缀，
+	// score=最近一次心跳的 Redis 服务器 Unix 秒。
+	//
+	// 启动清扫要回收「已死进程遗留的槽位」，判据必须是「该槽位的持有进程是否还活着」。
+	// 单实例时代用「成员前缀 != 本进程前缀」近似这个判据，多副本下该近似失效——
+	// 同伴 Pod 的在途槽位前缀同样 != 本进程前缀，会被误删。存活与否这个事实
+	// 只有 Redis 看得到（它是唯一能观察到全部实例的地方），因此把它显式建模在这里。
+	//
+	// 键名带 hash tag，保证注册表与其 epoch 键落在同一个 slot，心跳脚本可以一次改两个键。
+	instanceRegistryKey = "concurrency:{instances}"
+	// instanceRegistryEpochKey 记录注册表第一次建立的 Redis 时间（秒），只写一次、不过期。
+	// 它回答的是「这套 Redis 上的注册表启用多久了」，用于判断是否还处于滚动升级窗口。
+	instanceRegistryEpochKey = "concurrency:{instances}:epoch"
+)
+
+// instanceHeartbeatInterval 是实例心跳间隔，instanceHeartbeatStaleAfter 是判定
+// 实例已死的阈值。阈值取间隔的数倍，容忍偶发的 Redis 抖动或 GC 停顿。
+const (
+	instanceHeartbeatInterval   = 20 * time.Second
+	instanceHeartbeatStaleAfter = 90 * time.Second
+
+	// instanceRegistryRolloutGrace 是注册表刚建立后的宽限期，期间不做破坏性启动清扫。
+	//
+	// 注册表能证明「谁在上报心跳」，但证明不了「没有别人」。从不带注册表的旧版本滚动升级
+	// 时，仍在服务的旧副本一个都不会出现在注册表里：第一个新副本看到「只有我」，会把旧副本
+	// 的在途槽位与等待计数全部清掉——正是本次要修的那个故障，只是挪到了升级窗口里发生。
+	// 「所有存活进程都会上报心跳」这个前提，只有在注册表建立、且旧版本副本全部退场之后才
+	// 成立；而「升级有没有结束」这件事在编排层，进程内看不到，因此只能用时间兜底。
+	//
+	// 代价可控：宽限期内崩溃残留改由 acquire 路径的 ZREMRANGEBYSCORE 在一个 slot TTL 内
+	// 按分数回收（启动清扫本来也只是把这件事提前）。宽限期在一套 Redis 数据的生命周期里
+	// 只经历一次，此后每次重启/扩容都是全功能清扫。
+	instanceRegistryRolloutGrace = 30 * time.Minute
 )
 
 var (
@@ -330,18 +365,29 @@ var (
 		return 1
 	`)
 
-	// startupCleanupSlotScript 清理单个槽位 key 中非当前进程前缀的成员，避免 Redis Cluster CROSSSLOT。
-	// KEYS[1] 是有序集合键，ARGV[1] 是当前进程前缀，ARGV[2] 是槽位 TTL。
+	// startupCleanupSlotScript 清理单个槽位 key 中「持有进程已死」的成员，避免 Redis Cluster CROSSSLOT。
+	// KEYS[1] 是有序集合键，ARGV[1] 是槽位 TTL，ARGV[2..] 是当前存活实例的进程前缀列表。
+	//
+	// 判据是「成员前缀不在存活实例集合里」而不是「成员前缀 != 本进程前缀」：后者在多副本下
+	// 会把同伴 Pod 的在途槽位一并删掉，导致账号/用户并发上限被瞬间架空。
+	// 无法解析出前缀的成员一律保留，交给 acquire 路径上的 ZREMRANGEBYSCORE 按分数自然回收。
 	// 返回 {清除数量, 剩余成员数}，Go 侧据剩余数决定索引 member 去留，无需再回读槽位。
 	startupCleanupSlotScript = redis.NewScript(`
 		local key = KEYS[1]
-		local activePrefix = ARGV[1]
-		local slotTTL = tonumber(ARGV[2])
+		local slotTTL = tonumber(ARGV[1])
+		local live = {}
+		for i = 2, #ARGV do
+			live[ARGV[i]] = true
+		end
 		local removed = 0
 		local members = redis.call('ZRANGE', key, 0, -1)
 		for _, member in ipairs(members) do
-			if string.sub(member, 1, string.len(activePrefix)) ~= activePrefix then
-				removed = removed + redis.call('ZREM', key, member)
+			local sep = string.find(member, '-', 1, true)
+			if sep and sep > 1 then
+				local prefix = string.sub(member, 1, sep - 1)
+				if not live[prefix] then
+					removed = removed + redis.call('ZREM', key, member)
+				end
 			end
 		end
 		local remaining = redis.call('ZCARD', key)
@@ -351,6 +397,31 @@ var (
 			redis.call('EXPIRE', key, slotTTL)
 		end
 		return {removed, remaining}
+	`)
+
+	// instanceHeartbeatScript 注册/续期本实例并剔除心跳超时的实例，
+	// 返回 {当前时间, 注册表建立时间, 存活实例前缀列表}。
+	// 心跳与读取存活集合合并为一次往返：调用方拿到的集合必然已包含自己，
+	// 因此启动清扫绝不会因为「还没来得及注册」而把自己的槽位删掉。
+	//
+	// epoch 用 SET NX 落一次就不再改写，也不设过期：它是「注册表从什么时候开始生效」的
+	// 唯一凭据，启动清扫据此判断当前是否仍处于滚动升级窗口（此时可能存在不上报心跳的旧副本）。
+	// KEYS[1] 是注册表键，KEYS[2] 是 epoch 键；ARGV[1] 是本实例前缀，ARGV[2] 是判定实例已死的秒数阈值。
+	instanceHeartbeatScript = redis.NewScript(`
+		redis.replicate_commands()
+		local key = KEYS[1]
+		local epochKey = KEYS[2]
+		local self = ARGV[1]
+		local staleAfter = tonumber(ARGV[2])
+		local now = tonumber(redis.call('TIME')[1])
+		redis.call('ZADD', key, now, self)
+		redis.call('ZREMRANGEBYSCORE', key, '-inf', now - staleAfter)
+		redis.call('EXPIRE', key, staleAfter * 4)
+		redis.call('SET', epochKey, now, 'NX')
+		-- or 0：epoch 解析不出数值时也要返回一个数，Lua 表里出现 nil 会把返回数组
+		-- 从那里截断，调用方拿到的就成了「回包格式错误」而不是「建立时间未知」。
+		local epoch = tonumber(redis.call('GET', epochKey)) or 0
+		return {now, epoch, redis.call('ZRANGE', key, 0, -1)}
 	`)
 )
 
@@ -1136,15 +1207,108 @@ func (c *concurrencyCache) reconcileExpiredIndexCandidates(ctx context.Context, 
 	return nil
 }
 
-// CleanupStaleProcessSlots 启动时清理非当前进程前缀的槽位。
+// HeartbeatInstance 注册/续期本进程在存活实例注册表中的条目，并顺带剔除心跳超时的实例。
+func (c *concurrencyCache) HeartbeatInstance(ctx context.Context, requestPrefix string) error {
+	_, err := c.refreshInstanceRegistry(ctx, requestPrefix)
+	return err
+}
+
+// InstanceHeartbeatInterval 返回心跳上报间隔，供服务层的心跳循环使用。
+func (c *concurrencyCache) InstanceHeartbeatInterval() time.Duration {
+	return instanceHeartbeatInterval
+}
+
+// instanceRegistrySnapshot 是一次心跳往返看到的注册表状态。
+type instanceRegistrySnapshot struct {
+	// now 是 Redis 服务器当前时间（Unix 秒）。
+	now int64
+	// establishedAt 是注册表第一次建立的时间（Unix 秒）；0 表示未知。
+	establishedAt int64
+	// livePrefixes 是当前仍在上报心跳的实例前缀（必然含自己）。
+	livePrefixes []string
+}
+
+// withinRolloutGrace 判断注册表是否仍处于「可能存在不上报心跳的旧副本」的窗口。
+// 拿不到建立时间时按仍在窗口内处理：宁可少回收，也不能误删同伴的在途槽位。
+func (s instanceRegistrySnapshot) withinRolloutGrace() bool {
+	if s.now <= 0 || s.establishedAt <= 0 {
+		return true
+	}
+	return s.now-s.establishedAt < int64(instanceRegistryRolloutGrace.Seconds())
+}
+
+// refreshInstanceRegistry 上报本实例心跳并返回注册表快照。
+func (c *concurrencyCache) refreshInstanceRegistry(ctx context.Context, requestPrefix string) (instanceRegistrySnapshot, error) {
+	var snapshot instanceRegistrySnapshot
+	if c == nil || c.rdb == nil || requestPrefix == "" {
+		return snapshot, nil
+	}
+	raw, err := instanceHeartbeatScript.Run(
+		ctx, c.rdb,
+		[]string{instanceRegistryKey, instanceRegistryEpochKey},
+		requestPrefix, int64(instanceHeartbeatStaleAfter.Seconds()),
+	).Result()
+	if err != nil {
+		return snapshot, fmt.Errorf("refresh instance registry: %w", err)
+	}
+	reply, ok := raw.([]any)
+	if !ok || len(reply) != 3 {
+		return snapshot, fmt.Errorf("refresh instance registry: unexpected reply %T", raw)
+	}
+	snapshot.now, _ = reply[0].(int64)
+	snapshot.establishedAt, _ = reply[1].(int64)
+	entries, ok := reply[2].([]any)
+	if !ok {
+		return snapshot, fmt.Errorf("refresh instance registry: unexpected member list %T", reply[2])
+	}
+	snapshot.livePrefixes = make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if prefix, ok := entry.(string); ok && prefix != "" {
+			snapshot.livePrefixes = append(snapshot.livePrefixes, prefix)
+		}
+	}
+	return snapshot, nil
+}
+
+// CleanupStaleProcessSlots 启动时回收「持有进程已死」的槽位。
 // 清理范围来自活跃索引（含 score 已过期的成员——它们往往正是崩溃进程留下的残留），
 // 避免在 Redis 上 SCAN 全部 concurrency:* 键；另有一次性迁移清扫兜底索引机制上线前的遗留等待计数。
 // API Key 槽位（concurrency:api_key:*）是 stats-only 数据：每次 Track/读取都会按分数
 // 裁剪过期成员，key 自带 TTL，可在一个 slot TTL 内自愈，因此不参与启动清理。
+//
+// 多副本语义：先上报本实例心跳拿到存活实例集合，再只删不属于任何存活实例的成员。
+// 这样同伴 Pod 的在途槽位不会被误删，而崩溃进程的残留仍会在其心跳超时后被回收
+// （最坏延迟为 instanceHeartbeatStaleAfter；若期间无人重启，则由 acquire 路径上的
+// ZREMRANGEBYSCORE 在一个 slot TTL 内兜底）。
+//
+// 注册表刚建立时（见 instanceRegistryRolloutGrace）整个清扫直接跳过：那段窗口里
+// 「不在注册表里」既可能是已死进程，也可能是还没升级、根本不上报心跳的旧副本，
+// 两者在 Redis 里无法区分，只能都不动。
 func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error {
 	if activeRequestPrefix == "" {
 		return nil
 	}
+	registry, err := c.refreshInstanceRegistry(ctx, activeRequestPrefix)
+	if err != nil {
+		return err
+	}
+	if registry.withinRolloutGrace() {
+		logger.LegacyPrintf("repository.concurrency",
+			"Info: instance registry younger than the %s rollout grace; skipping startup slot cleanup (stale slots fall back to score-based expiry within one slot TTL)",
+			instanceRegistryRolloutGrace)
+		return nil
+	}
+	livePrefixes := registry.livePrefixes
+	if len(livePrefixes) == 0 {
+		// 注册表不可用时宁可不清理，也不能退回「删掉所有非本进程成员」的旧语义。
+		livePrefixes = []string{activeRequestPrefix}
+	}
+	// 只有本实例存活时，等待计数必然全部随上一代进程消失，可以安全清零；
+	// 一旦存在同伴，等待计数里就可能有同伴正在排队的请求，不能碰。
+	// （代价是崩溃实例遗留的等待计数要等 waitQueueTTL 自然过期——等待计数没有
+	// 进程归属信息，无法精确回收，这里选择宁可少算并发也不误杀同伴的排队。）
+	soleInstance := len(livePrefixes) == 1 && livePrefixes[0] == activeRequestPrefix
+
 	if err := c.sweepLegacyWaitKeysOnce(ctx); err != nil {
 		return err
 	}
@@ -1157,7 +1321,7 @@ func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeR
 	if err != nil {
 		return err
 	}
-	if err := c.cleanupStaleProcessSlotsForIndex(ctx, accountSlotIndex, accountMembers, activeRequestPrefix, now); err != nil {
+	if err := c.cleanupStaleProcessSlotsForIndex(ctx, accountSlotIndex, accountMembers, livePrefixes, soleInstance, now); err != nil {
 		return err
 	}
 
@@ -1165,7 +1329,7 @@ func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeR
 	if err != nil {
 		return err
 	}
-	return c.cleanupStaleProcessSlotsForIndex(ctx, userSlotIndex, userMembers, activeRequestPrefix, now)
+	return c.cleanupStaleProcessSlotsForIndex(ctx, userSlotIndex, userMembers, livePrefixes, soleInstance, now)
 }
 
 // sweepLegacyWaitKeysOnce 一次性清扫活跃索引机制上线前遗留的等待计数键。
@@ -1221,9 +1385,16 @@ func (c *concurrencyCache) cleanupStaleProcessSlotsForIndex(
 	ctx context.Context,
 	spec slotIndexSpec,
 	members []string,
-	activeRequestPrefix string,
+	livePrefixes []string,
+	soleInstance bool,
 	now int64,
 ) error {
+	scriptArgs := make([]any, 0, len(livePrefixes)+1)
+	scriptArgs = append(scriptArgs, c.slotTTLSeconds)
+	for _, prefix := range livePrefixes {
+		scriptArgs = append(scriptArgs, prefix)
+	}
+
 	staleMembers := make([]string, 0)
 	refreshed := make([]redis.Z, 0)
 	for _, member := range members {
@@ -1233,15 +1404,26 @@ func (c *concurrencyCache) cleanupStaleProcessSlotsForIndex(
 			continue
 		}
 
-		_, remaining, err := runScriptInt64Pair(ctx, c.rdb, startupCleanupSlotScript, []string{spec.slotKey(id)}, activeRequestPrefix, c.slotTTLSeconds)
+		_, remaining, err := runScriptInt64Pair(ctx, c.rdb, startupCleanupSlotScript, []string{spec.slotKey(id)}, scriptArgs...)
 		if err != nil {
 			return fmt.Errorf("cleanup stale process slots %s: %w", spec.slotKey(id), err)
 		}
-		// 等待计数属于已死进程，直接删除；剩余槽位（当前进程前缀）决定索引 member 去留。
-		if err := c.rdb.Del(ctx, spec.waitKey(id)).Err(); err != nil {
-			return fmt.Errorf("delete stale wait key %s: %w", spec.waitKey(id), err)
+		// 只有本实例存活时，等待计数才必然属于已死进程，可以直接删除。
+		waiting := int64(0)
+		if soleInstance {
+			if err := c.rdb.Del(ctx, spec.waitKey(id)).Err(); err != nil {
+				return fmt.Errorf("delete stale wait key %s: %w", spec.waitKey(id), err)
+			}
+		} else {
+			// 保留了同伴的等待计数，索引 member 就不能只看剩余槽位数，
+			// 否则「槽位为空但仍有人排队」的账号会被移出索引、失去后续清理与负载统计。
+			count, err := c.rdb.Get(ctx, spec.waitKey(id)).Int64()
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return fmt.Errorf("read wait key %s: %w", spec.waitKey(id), err)
+			}
+			waiting = count
 		}
-		if remaining > 0 {
+		if remaining > 0 || waiting > 0 {
 			refreshed = append(refreshed, redis.Z{
 				Score:  float64(now + int64(c.slotTTLSeconds)),
 				Member: member,

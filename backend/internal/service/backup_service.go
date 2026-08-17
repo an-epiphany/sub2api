@@ -26,6 +26,11 @@ import (
 )
 
 const (
+	// backupPeerRecordStaleAfter 是判定「同伴的 running 记录已经死了」的时间下限。
+	// 取值刻意保守：误判为「还活着」只是让记录多挂一会儿（可观测性问题），
+	// 误判为「已经死了」会删掉对方正在上传的 S3 产物（数据销毁）。
+	backupPeerRecordStaleAfter = 2 * time.Hour
+
 	settingKeyBackupS3Config = "backup_s3_config"
 	settingKeyBackupSchedule = "backup_schedule"
 	settingKeyBackupRecords  = "backup_records"
@@ -47,6 +52,19 @@ const (
 	// worst-case runtime (the scheduled backup context is bounded at 30m) so the
 	// lock cannot expire mid-dump and let a peer start a second backup.
 	backupScheduledLeaderLockTTL = 35 * time.Minute
+
+	// backupRecoverySweepInterval 是 running 记录回收的复检间隔。
+	//
+	// 只在启动时回收一次是不够的：同伴（以及本进程上一代——进程 ID 每次启动都会变）
+	// 的记录要过了 backupPeerRecordStaleAfter 才能断定已死，而那个时刻通常没有任何
+	// 启动事件，记录会永远卡在 running，它的 S3 产物也永远没人清理。
+	backupRecoverySweepInterval = 15 * time.Minute
+	// backupRecoveryLeaderLockKey 让周期复检在整个部署里只由一个实例执行：
+	// 备份记录是 settings 里的单行 JSON，多个实例同时读-改-写会互相覆盖。
+	backupRecoveryLeaderLockKey = "backup:recovery:leader"
+	// backupRecoveryLeaderLockTTL 必须覆盖一次复检的最坏耗时
+	// （逐条记录读写 + 每条最多 backupObjectCleanupTimeout 的 S3 删除）。
+	backupRecoveryLeaderLockTTL = 10 * time.Minute
 )
 
 var (
@@ -119,22 +137,32 @@ type BackupScheduleConfig struct {
 
 // BackupRecord 备份记录
 type BackupRecord struct {
-	ID            string       `json:"id"`
-	Status        string       `json:"status"`      // pending, running, completed, failed
-	BackupType    string       `json:"backup_type"` // postgres
-	FileName      string       `json:"file_name"`
-	S3Key         string       `json:"s3_key"`
-	Parts         []BackupPart `json:"parts,omitempty"`
-	SizeBytes     int64        `json:"size_bytes"`
-	TriggeredBy   string       `json:"triggered_by"` // manual, scheduled
-	ErrorMsg      string       `json:"error_message,omitempty"`
-	StartedAt     string       `json:"started_at"`
-	FinishedAt    string       `json:"finished_at,omitempty"`
-	ExpiresAt     string       `json:"expires_at,omitempty"`     // 过期时间
-	Progress      string       `json:"progress,omitempty"`       // "dumping", "uploading", ""
-	RestoreStatus string       `json:"restore_status,omitempty"` // "", "running", "completed", "failed"
-	RestoreError  string       `json:"restore_error,omitempty"`
-	RestoredAt    string       `json:"restored_at,omitempty"`
+	ID          string       `json:"id"`
+	Status      string       `json:"status"`      // pending, running, completed, failed
+	BackupType  string       `json:"backup_type"` // postgres
+	FileName    string       `json:"file_name"`
+	S3Key       string       `json:"s3_key"`
+	Parts       []BackupPart `json:"parts,omitempty"`
+	SizeBytes   int64        `json:"size_bytes"`
+	TriggeredBy string       `json:"triggered_by"` // manual, scheduled
+	// OwnerInstanceID 记录是哪个实例在执行这次备份。多副本下启动回收必须据此
+	// 区分「自己的崩溃残留」和「同伴正在跑的备份」，否则会把对方的 S3 产物删掉。
+	// 升级前写下的记录该字段为空，按旧语义立即回收。
+	OwnerInstanceID string `json:"owner_instance_id,omitempty"`
+	ErrorMsg        string `json:"error_message,omitempty"`
+	StartedAt       string `json:"started_at"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	ExpiresAt       string `json:"expires_at,omitempty"`     // 过期时间
+	Progress        string `json:"progress,omitempty"`       // "dumping", "uploading", ""
+	RestoreStatus   string `json:"restore_status,omitempty"` // "", "running", "completed", "failed"
+	RestoreError    string `json:"restore_error,omitempty"`
+	RestoredAt      string `json:"restored_at,omitempty"`
+	// RestoreOwnerInstanceID / RestoreStartedAt 描述的是「谁在执行这次恢复、什么时候开始的」。
+	// 恢复不能复用上面那两个字段：它们记的是备份本身，一次三小时前的备份现在被同伴恢复时，
+	// 用备份的开始时间去判活会把正在跑的恢复直接判死（标记 failed）。
+	// 升级前写下的记录这两个字段为空，与 owner 为空同样按旧语义立即回收。
+	RestoreOwnerInstanceID string `json:"restore_owner_instance_id,omitempty"`
+	RestoreStartedAt       string `json:"restore_started_at,omitempty"`
 }
 
 // BackupDownloadPart 描述一个可下载的备份分卷。
@@ -190,6 +218,11 @@ type BackupService struct {
 	bgCtx         context.Context    // 所有后台操作的 parent context
 	bgCancel      context.CancelFunc // 取消所有活跃后台操作
 	partSizeBytes int64              // 分卷阈值；生产使用 4 GiB，测试可注入更小值
+
+	// recoverStop 关闭周期性回收复检循环。不挂在 wg 上：wg 是「等活跃备份跑完」的，
+	// 复检循环必须在 Stop 一开始就退出，不能让它拖住关停。
+	recoverStop     chan struct{}
+	recoverStopOnce sync.Once
 }
 
 func NewBackupService(
@@ -211,6 +244,9 @@ func NewBackupService(
 		bgCancel:                bgCancel,
 		partSizeBytes:           defaultBackupPartSizeBytes,
 		instanceID:              uuid.NewString(),
+		// 在构造时建好：Start 只负责起 goroutine，Stop 只负责关闭，
+		// 字段本身不再有跨 goroutine 的写入。
+		recoverStop: make(chan struct{}),
 	}
 }
 
@@ -232,6 +268,9 @@ func (s *BackupService) Start() {
 
 	// 清理重启后孤立的 running 记录
 	s.recoverStaleRecords()
+	// 启动只是回收的第一次机会：同伴（含本进程上一代）的记录要过了阈值才能断定已死，
+	// 那一刻通常没有任何启动事件，所以还要周期复检。
+	s.startRecoverySweeper()
 
 	// 加载已有的定时配置
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -248,7 +287,49 @@ func (s *BackupService) Start() {
 	}
 }
 
-// recoverStaleRecords 启动时将孤立的 running 记录标记为 failed，并清理已上传对象。
+// startRecoverySweeper 周期复检 running 记录。
+//
+// 复检要跨实例串行：备份记录是 settings 里的单行 JSON，读-改-写没有并发保护，
+// 多个实例同时回收会互相覆盖对方的写入，还会对同一批 S3 对象重复发删除。
+func (s *BackupService) startRecoverySweeper() {
+	if s == nil || s.recoverStop == nil || backupRecoverySweepInterval <= 0 {
+		return
+	}
+	stop := s.recoverStop
+	go func() {
+		ticker := time.NewTicker(backupRecoverySweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if s.shuttingDown.Load() {
+					return
+				}
+				s.recoverStaleRecordsAsLeader()
+			}
+		}
+	}()
+}
+
+// recoverStaleRecordsAsLeader 在拿到 leader lock 时执行一次回收复检。
+// ctx 只用于抢锁；回收本身按记录逐条使用自己的超时。
+func (s *BackupService) recoverStaleRecordsAsLeader() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	release, acquired := tryAcquireSingletonLeaderLock(
+		ctx, s.lockCache, s.db,
+		backupRecoveryLeaderLockKey, s.instanceID, backupRecoveryLeaderLockTTL,
+	)
+	if !acquired {
+		return
+	}
+	defer release()
+	s.recoverStaleRecords()
+}
+
+// recoverStaleRecords 将确实已经没有执行者的 running 记录标记为 failed，并清理已上传对象。
 func (s *BackupService) recoverStaleRecords() {
 	loadCtx, loadCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer loadCancel()
@@ -257,8 +338,10 @@ func (s *BackupService) recoverStaleRecords() {
 	if err != nil {
 		return
 	}
+	now := time.Now()
 	for i := range records {
-		if records[i].Status == "running" {
+		if records[i].Status == "running" &&
+			s.canReclaimRunningOperation(records[i].OwnerInstanceID, records[i].StartedAt, now) {
 			staleRecord := records[i]
 			records[i].Status = "failed"
 			records[i].ErrorMsg = "interrupted by server restart"
@@ -273,13 +356,44 @@ func (s *BackupService) recoverStaleRecords() {
 			}
 			logger.LegacyPrintf("service.backup", "[Backup] recovered stale running record: %s", records[i].ID)
 		}
-		if records[i].RestoreStatus == "running" {
+		if records[i].RestoreStatus == "running" &&
+			s.canReclaimRunningOperation(records[i].RestoreOwnerInstanceID, records[i].RestoreStartedAt, now) {
 			records[i].RestoreStatus = "failed"
 			records[i].RestoreError = "interrupted by server restart"
 			s.saveRecoveredRecord(&records[i])
 			logger.LegacyPrintf("service.backup", "[Backup] recovered stale restoring record: %s", records[i].ID)
 		}
 	}
+}
+
+// canReclaimRunningOperation 判断一次仍标记为 running 的操作（备份或恢复）
+// 是否确实已经没有执行者。owner/startedAt 必须来自这次操作本身：备份用
+// OwnerInstanceID/StartedAt，恢复用 RestoreOwnerInstanceID/RestoreStartedAt。
+// 拿备份的元数据去判恢复，会因为「备份是几小时前做的」而把正在跑的恢复判死。
+//
+// 旧实现默认「凡是 running 就是我上次崩溃留下的」，这个前提只在单实例下成立：
+// 多副本时同伴 Pod 可能正在跑这条备份，改写记录会让它的 S3 产物成为孤儿，
+// 而 cleanupStaleBackupObjects 还会直接把对方正在上传的对象删掉。
+//
+// 判据按可确定性从强到弱：
+//   - owner 为空：升级前写下的记录，无从判断，沿用旧语义立即回收（否则永远卡住）
+//   - owner 是本实例：上一代进程的残留，立即回收
+//   - owner 是同伴：只有超过 backupPeerRecordStaleAfter 才能断定它已经死了；
+//     时间无法解析时按「还活着」处理，宁可少回收也不误删。
+//
+// 「本实例」用的是每次启动都会重新生成的进程 ID，因此进程重启后自己上一代的记录
+// 也会落到「同伴」分支，要等阈值。这正是需要周期复检（见 startRecoverySweeper）的原因：
+// 只在启动跑一次的话，阈值到达的那一刻没有任何人在看，记录会永远卡在 running。
+func (s *BackupService) canReclaimRunningOperation(ownerInstanceID, startedAt string, now time.Time) bool {
+	owner := strings.TrimSpace(ownerInstanceID)
+	if owner == "" || owner == s.instanceID {
+		return true
+	}
+	started, err := time.Parse(time.RFC3339, strings.TrimSpace(startedAt))
+	if err != nil {
+		return false
+	}
+	return now.Sub(started) > backupPeerRecordStaleAfter
 }
 
 func (s *BackupService) saveRecoveredRecord(record *BackupRecord) {
@@ -302,6 +416,12 @@ func (s *BackupService) cleanupStaleBackupObjects(record *BackupRecord) error {
 // Stop 停止定时备份并等待活跃操作完成
 func (s *BackupService) Stop() {
 	s.shuttingDown.Store(true)
+
+	s.recoverStopOnce.Do(func() {
+		if s.recoverStop != nil {
+			close(s.recoverStop)
+		}
+	})
 
 	s.cronMu.Lock()
 	if s.cronSched != nil {
@@ -587,14 +707,15 @@ func (s *BackupService) CreateBackup(ctx context.Context, triggeredBy string, ex
 	}
 
 	record := &BackupRecord{
-		ID:          backupID,
-		Status:      "running",
-		BackupType:  "postgres",
-		FileName:    fileName,
-		S3Key:       s3Key,
-		TriggeredBy: triggeredBy,
-		StartedAt:   now.Format(time.RFC3339),
-		ExpiresAt:   expiresAt,
+		ID:              backupID,
+		Status:          "running",
+		BackupType:      "postgres",
+		FileName:        fileName,
+		S3Key:           s3Key,
+		TriggeredBy:     triggeredBy,
+		OwnerInstanceID: s.instanceID,
+		StartedAt:       now.Format(time.RFC3339),
+		ExpiresAt:       expiresAt,
 	}
 
 	archivePath, sizeBytes, err := s.createCompressedBackupFile(ctx)
@@ -676,15 +797,16 @@ func (s *BackupService) StartBackup(ctx context.Context, triggeredBy string, exp
 	}
 
 	record := &BackupRecord{
-		ID:          backupID,
-		Status:      "running",
-		BackupType:  "postgres",
-		FileName:    fileName,
-		S3Key:       s3Key,
-		TriggeredBy: triggeredBy,
-		StartedAt:   now.Format(time.RFC3339),
-		ExpiresAt:   expiresAt,
-		Progress:    "pending",
+		ID:              backupID,
+		Status:          "running",
+		BackupType:      "postgres",
+		FileName:        fileName,
+		S3Key:           s3Key,
+		TriggeredBy:     triggeredBy,
+		OwnerInstanceID: s.instanceID,
+		StartedAt:       now.Format(time.RFC3339),
+		ExpiresAt:       expiresAt,
+		Progress:        "pending",
 	}
 
 	if err := s.saveRecord(ctx, record); err != nil {
@@ -967,6 +1089,11 @@ func (s *BackupService) StartRestore(ctx context.Context, backupID string) (*Bac
 	}
 
 	record.RestoreStatus = "running"
+	// 恢复有自己的执行者与开始时间：回收判定要问的是「这次恢复还有人在跑吗」，
+	// 而不是「这份备份是谁什么时候做的」。
+	record.RestoreOwnerInstanceID = s.instanceID
+	record.RestoreStartedAt = time.Now().Format(time.RFC3339)
+	record.RestoreError = ""
 	_ = s.saveRecord(ctx, record)
 
 	launched = true

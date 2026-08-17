@@ -670,7 +670,38 @@ type ServerConfig struct {
 	TrustedProxiesConfigured bool      `mapstructure:"-" json:"-" yaml:"-"`   // 是否显式配置了可信代理列表
 	MaxRequestBodySize       int64     `mapstructure:"max_request_body_size"` // 全局最大请求体限制
 	H2C                      H2CConfig `mapstructure:"h2c"`                   // HTTP/2 Cleartext 配置
+
+	// ShutdownTimeoutSeconds 是优雅关闭的上限。本服务刻意不设 WriteTimeout
+	// （流式响应可能持续十几分钟），所以这个值直接决定滚动更新时会截断多长的在途流。
+	// 取值应大于典型流式请求时长，并小于 K8s 的 terminationGracePeriodSeconds。
+	ShutdownTimeoutSeconds int `mapstructure:"shutdown_timeout"`
+	// ShutdownDrainDelaySeconds 是收到 SIGTERM 后、开始关闭前的等待时长。
+	// 这段时间内 /readyz 已经返回 503 但仍正常服务，留给 K8s 把本 Pod 摘出
+	// Service endpoints（endpoint 传播是异步的），避免关闭中途还在收新请求。
+	ShutdownDrainDelaySeconds int `mapstructure:"shutdown_drain_delay"`
 }
+
+// ShutdownTimeout 返回优雅关闭上限。
+func (c ServerConfig) ShutdownTimeout() time.Duration {
+	if c.ShutdownTimeoutSeconds <= 0 {
+		return time.Duration(defaultShutdownTimeoutSeconds) * time.Second
+	}
+	return time.Duration(c.ShutdownTimeoutSeconds) * time.Second
+}
+
+// ShutdownDrainDelay 返回摘除 endpoint 的等待时长。
+func (c ServerConfig) ShutdownDrainDelay() time.Duration {
+	if c.ShutdownDrainDelaySeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.ShutdownDrainDelaySeconds) * time.Second
+}
+
+const (
+	// defaultShutdownTimeoutSeconds 默认 30 秒：显著优于原先硬编码的 5 秒，
+	// 又不会让单实例 docker 部署的重启变慢太多。跑长流式请求的部署应显式调大。
+	defaultShutdownTimeoutSeconds = 30
+)
 
 // H2CConfig HTTP/2 Cleartext 配置
 type H2CConfig struct {
@@ -1913,6 +1944,8 @@ func setDefaults() {
 	viper.SetDefault("server.max_header_bytes", 64*1024)
 	viper.SetDefault("server.idle_timeout", 120) // 120秒空闲超时
 	viper.SetDefault("server.max_request_body_size", int64(256*1024*1024))
+	viper.SetDefault("server.shutdown_timeout", defaultShutdownTimeoutSeconds)
+	viper.SetDefault("server.shutdown_drain_delay", 0)
 	// H2C 默认配置
 	viper.SetDefault("server.h2c.enabled", false)
 	viper.SetDefault("server.h2c.max_concurrent_streams", uint32(50))      // 50 个并发流

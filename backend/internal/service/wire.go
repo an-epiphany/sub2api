@@ -10,7 +10,10 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/payment"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/oauth"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/google/wire"
 	"github.com/redis/go-redis/v9"
@@ -111,9 +114,48 @@ func ProvideOpenAIOAuthService(
 	proxyRepo ProxyRepository,
 	oauthClient OpenAIOAuthClient,
 	privacyClientFactory PrivacyClientFactory,
+	redisClient *redis.Client,
 ) *OpenAIOAuthService {
 	svc := NewOpenAIOAuthService(proxyRepo, oauthClient)
 	svc.SetPrivacyClientFactory(privacyClientFactory)
+	if redisClient != nil {
+		svc = svc.WithSessionStore(openai.NewRedisSessionStore(redisClient))
+	}
+	return svc
+}
+
+// 以下三个 provider 与 ProvideGrokOAuthService 同构：把管理端加账号流程的 PKCE 会话
+// 换成 Redis 共享存储。generate-auth-url 与 exchange-code 是两次独立 HTTP 请求，
+// 多副本下会落到不同副本，会话不共享时 exchange-code 成功率退化为 1/N。
+
+func ProvideClaudeOAuthService(proxyRepo ProxyRepository, oauthClient ClaudeOAuthClient, redisClient *redis.Client) *OAuthService {
+	svc := NewOAuthService(proxyRepo, oauthClient)
+	if redisClient != nil {
+		svc = svc.WithSessionStore(oauth.NewRedisSessionStore(redisClient))
+	}
+	return svc
+}
+
+func ProvideGeminiOAuthService(
+	proxyRepo ProxyRepository,
+	oauthClient GeminiOAuthClient,
+	codeAssist GeminiCliCodeAssistClient,
+	driveClient geminicli.DriveClient,
+	cfg *config.Config,
+	redisClient *redis.Client,
+) *GeminiOAuthService {
+	svc := NewGeminiOAuthService(proxyRepo, oauthClient, codeAssist, driveClient, cfg)
+	if redisClient != nil {
+		svc = svc.WithSessionStore(geminicli.NewRedisSessionStore(redisClient))
+	}
+	return svc
+}
+
+func ProvideAntigravityOAuthService(proxyRepo ProxyRepository, redisClient *redis.Client) *AntigravityOAuthService {
+	svc := NewAntigravityOAuthService(proxyRepo)
+	if redisClient != nil {
+		svc = svc.WithSessionStore(antigravity.NewRedisSessionStore(redisClient))
+	}
 	return svc
 }
 
@@ -378,9 +420,12 @@ func ProvideDeferredService(accountRepo AccountRepository, timingWheel *TimingWh
 // ProvideConcurrencyService creates ConcurrencyService and starts slot cleanup worker.
 func ProvideConcurrencyService(cache ConcurrencyCache, accountRepo AccountRepository, cfg *config.Config) *ConcurrencyService {
 	svc := NewConcurrencyService(cache)
+	// 顺序不能反：启动清扫内部会先把本进程注册进存活实例注册表，再据此判断哪些
+	// 槽位属于已死进程；心跳循环随后负责持续续期，避免本进程被同伴误判为已死。
 	if err := svc.CleanupStaleProcessSlots(context.Background()); err != nil {
 		logger.LegacyPrintf("service.concurrency", "Warning: startup cleanup stale process slots failed: %v", err)
 	}
+	svc.StartInstanceHeartbeat()
 	if cfg != nil {
 		svc.SetAccountLoadBatchCacheTTL(time.Duration(cfg.Gateway.Scheduling.LoadBatchCacheTTLMS) * time.Millisecond)
 		svc.StartSlotCleanupWorker(accountRepo, cfg.Gateway.Scheduling.SlotCleanupInterval)
@@ -563,8 +608,11 @@ func ProvideScheduledTestRunnerService(
 	accountTestSvc *AccountTestService,
 	rateLimitSvc *RateLimitService,
 	cfg *config.Config,
+	lockCache LeaderLockCache,
+	db *sql.DB,
 ) *ScheduledTestRunnerService {
 	svc := NewScheduledTestRunnerService(planRepo, scheduledSvc, accountTestSvc, rateLimitSvc, cfg)
+	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc
 }
@@ -629,6 +677,8 @@ func ProvideBackupService(
 	db *sql.DB,
 ) *BackupService {
 	svc := NewBackupService(settingRepo, cfg, encryptor, storeFactory, dumper)
+	// 必须在 Start 之前注入：Start 会跑 recoverStaleRecords 并注册 cron，
+	// 两者都依赖 instanceID/lock 才能区分同伴实例与本进程的残留。
 	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc
@@ -692,9 +742,33 @@ func ProvideOpsIngressRejectAggregator(opsRepo OpsRepository, opsService *OpsSer
 	return aggregator
 }
 
+// ProvideChannelService wires ChannelService with the cross-instance snapshot
+// invalidation broadcast. 渠道快照持有定价/模型映射/模型白名单，直接决定计费单价，
+// 多副本下不广播失效会导致同一用户在不同副本被按不同单价扣费。
+func ProvideChannelService(
+	repo ChannelRepository,
+	groupRepo GroupRepository,
+	authCacheInvalidator APIKeyAuthCacheInvalidator,
+	pricingService *PricingService,
+	snapshotCache SnapshotInvalidationCache,
+) *ChannelService {
+	svc := NewChannelService(repo, groupRepo, authCacheInvalidator, pricingService)
+	svc.SetSnapshotInvalidationCache(context.Background(), snapshotCache)
+	return svc
+}
+
 // ProvideSettingService wires SettingService with group reader and proxy repo.
-func ProvideSettingService(settingRepo SettingRepository, groupRepo GroupRepository, proxyRepo ProxyRepository, cfg *config.Config) *SettingService {
+func ProvideSettingService(
+	settingRepo SettingRepository,
+	groupRepo GroupRepository,
+	proxyRepo ProxyRepository,
+	cfg *config.Config,
+	snapshotCache SnapshotInvalidationCache,
+) *SettingService {
 	svc := NewSettingService(settingRepo, cfg)
+	// 设置变更只会落到处理该管理请求的那一个副本，其余副本靠广播失效，
+	// 否则要等各自缓存 TTL（约 60 秒）才生效。
+	svc.SetSnapshotInvalidationCache(context.Background(), snapshotCache)
 	svc.SetDefaultSubscriptionGroupReader(groupRepo)
 	svc.SetProxyRepository(proxyRepo)
 	if err := svc.LoadForwardedClientIPSettings(context.Background()); err != nil {
@@ -779,15 +853,15 @@ var ProviderSet = wire.NewSet(
 	ProvideBatchImageCleanupService,
 	ProvideBatchImageWorkerRuntime,
 	wire.Bind(new(AccountRuntimeBlocker), new(*OpenAIGatewayService)),
-	NewOAuthService,
+	ProvideClaudeOAuthService,
 	ProvideOpenAIOAuthService,
 	ProvideGrokOAuthService,
 	wire.Bind(new(GrokOAuthTokenService), new(*GrokOAuthService)),
-	NewGeminiOAuthService,
+	ProvideGeminiOAuthService,
 	NewGeminiQuotaService,
 	NewCompositeTokenCacheInvalidator,
 	wire.Bind(new(TokenCacheInvalidator), new(*CompositeTokenCacheInvalidator)),
-	NewAntigravityOAuthService,
+	ProvideAntigravityOAuthService,
 	ProvideOAuthRefreshAPI,
 	ProvideGeminiTokenProvider,
 	NewGeminiMessagesCompatService,
@@ -854,7 +928,7 @@ var ProviderSet = wire.NewSet(
 	ProvideScheduledTestService,
 	ProvideScheduledTestRunnerService,
 	NewGroupCapacityService,
-	NewChannelService,
+	ProvideChannelService,
 	wire.Bind(new(ChannelCacheInvalidator), new(*ChannelService)),
 	NewModelPricingResolver,
 	NewContentModerationService,
@@ -923,8 +997,14 @@ func ProvideChannelMonitorService(
 // 通过 SetScheduler 注入回 service 后再 Start，确保启动时加载所有 enabled monitor，
 // 后续 CRUD 也能即时同步任务表。Runner.Stop 由 cleanup function 调用。
 // settingService 用于 runner 每次 fire 读取功能开关。
-func ProvideChannelMonitorRunner(svc *ChannelMonitorService, settingService *SettingService) *ChannelMonitorRunner {
+func ProvideChannelMonitorRunner(
+	svc *ChannelMonitorService,
+	settingService *SettingService,
+	lockCache LeaderLockCache,
+	db *sql.DB,
+) *ChannelMonitorRunner {
 	r := NewChannelMonitorRunner(svc, settingService)
+	r.SetLeaderLock(lockCache, db)
 	if svc != nil {
 		// Ensure runtime reader is set even if ProvideChannelMonitorService
 		// was constructed without settings (tests / alternate providers).

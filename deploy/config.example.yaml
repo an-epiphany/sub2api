@@ -50,6 +50,24 @@ server:
   # Applies to all requests, especially important for h2c first request memory protection
   # 适用于所有请求，对 h2c 第一请求的内存保护尤为重要
   max_request_body_size: 268435456
+  # Graceful shutdown timeout in seconds (default: 30)
+  # 优雅关闭超时（秒，默认 30）
+  # This server deliberately has no WriteTimeout because streaming responses can run
+  # for many minutes, so this value decides how long an in-flight stream may be cut
+  # short during a rolling update. Set it above your typical streaming request length,
+  # and below the Kubernetes terminationGracePeriodSeconds.
+  # 本服务刻意不设 WriteTimeout（流式响应可能持续十几分钟），因此该值直接决定
+  # 滚动更新时会截断多长的在途流。应大于典型流式请求时长，并小于 K8s 的
+  # terminationGracePeriodSeconds。
+  shutdown_timeout: 30
+  # Delay in seconds between receiving SIGTERM and starting shutdown (default: 0)
+  # 收到 SIGTERM 后、开始关闭前的等待秒数（默认 0）
+  # During this window /readyz already returns 503 while the instance keeps serving,
+  # giving Kubernetes time to remove this Pod from the Service endpoints. Set to
+  # 5-10 in multi-replica deployments; leave at 0 for single-instance Docker.
+  # 这段时间内 /readyz 已返回 503 但仍正常服务，留给 K8s 把本 Pod 摘出 endpoints。
+  # 多副本部署建议设为 5-10；单实例 Docker 保持 0 即可。
+  shutdown_drain_delay: 0
   # HTTP/2 Cleartext (h2c) configuration
   # HTTP/2 Cleartext (h2c) 配置
   h2c:

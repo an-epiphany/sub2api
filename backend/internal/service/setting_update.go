@@ -86,6 +86,16 @@ func (s *SettingService) UpdateSettingsWithAuthSourceDefaultsOmitting(ctx contex
 // it omitted, so in that case the caches are rebuilt from storage rather than
 // from the request struct.
 func (s *SettingService) refreshCachedSettingsAfterWrite(ctx context.Context, settings *SystemSettings, omitted OmittedSettingKeys) {
+	// 其余副本没有这次写入的内容，只能收到广播后自己回读一遍；不广播的话它们要等
+	// 各自缓存的 TTL（约 60 秒）才生效。
+	//
+	// 用 defer 是为了把广播和「本副本能否重建自己的快照」解耦：写库已经成功，
+	// 回读失败（典型情形是请求 ctx 在写库之后才超时）只是本副本的问题，
+	// 不该顺带让所有同伴一起陈旧。广播同时会驱动本副本用独立 ctx 再回读一次，
+	// 因此下面的失败分支也能自愈。
+	defer s.broadcastSettingsInvalidation(ctx)
+
+	// 本副本手里就有新值，直接刷新，省掉一次回读。
 	if len(omitted) == 0 {
 		s.refreshCachedSettings(settings)
 		return

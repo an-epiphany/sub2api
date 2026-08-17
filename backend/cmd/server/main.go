@@ -179,11 +179,25 @@ func runMainServer() {
 
 	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 先翻转就绪状态：/readyz 立即返回 503，K8s 据此把本 Pod 摘出 Service
+	// endpoints。/health（liveness）保持 200，否则 kubelet 会在优雅退出中途
+	// 直接杀进程，在途的流式响应反而被截断得更早。
+	app.Drain.BeginDraining()
+
+	// endpoint 摘除是异步的，这段延迟让在途请求跑完的同时不再收到新流量。
+	if delay := cfg.Server.ShutdownDrainDelay(); delay > 0 {
+		log.Printf("Draining: waiting %s for load balancers to remove this instance", delay)
+		time.Sleep(delay)
+	}
+
+	// 本服务刻意不设 WriteTimeout（流式响应可能持续十几分钟），因此这个超时
+	// 直接决定滚动更新会截断多长的在途流。可通过 SERVER_SHUTDOWN_TIMEOUT 调整。
+	shutdownTimeout := cfg.Server.ShutdownTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	if err := app.Server.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+		log.Printf("Server forced to shutdown after %s: %v", shutdownTimeout, err)
 	}
 
 	log.Println("Server exited")

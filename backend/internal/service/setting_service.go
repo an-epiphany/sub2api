@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -117,6 +119,11 @@ type WebSearchManagerBuilder func(cfg *WebSearchEmulationConfig, proxyURLs map[i
 
 // SettingService 系统设置服务
 type SettingService struct {
+	// snapshotInvalidator 把设置变更广播到全部副本。约 10 项运行时设置存在
+	// 进程内 atomic.Value 快照里，管理请求只落到一个副本，其余副本不收到广播
+	// 就要等各自缓存 TTL（约 60 秒）才生效。
+	snapshotInvalidator *SnapshotInvalidator
+
 	settingRepo                 SettingRepository
 	defaultSubGroupReader       DefaultSubscriptionGroupReader
 	proxyRepo                   ProxyRepository // for resolving websearch provider proxy URLs
@@ -434,3 +441,42 @@ func (s *SettingService) getStringOrDefault(settings map[string]string, key, def
 	}
 	return defaultValue
 }
+
+// SetSnapshotInvalidationCache 注入跨实例失效广播通道并启动订阅。
+// 未注入时（单实例部署、单元测试）退化为纯本地刷新。
+func (s *SettingService) SetSnapshotInvalidationCache(ctx context.Context, cache SnapshotInvalidationCache) {
+	if s == nil {
+		return
+	}
+	s.snapshotInvalidator = NewSnapshotInvalidator(cache, SnapshotTopicSettings, s.reloadCachedSettingsFromStore)
+	s.snapshotInvalidator.Start(ctx)
+}
+
+// reloadCachedSettingsFromStore 从数据库回读并重建本进程的设置快照。
+// 它同时是失效广播的订阅回调：收到广播的副本手里没有这次写入的内容，
+// 只能回读。这里绝不能再发广播，否则消息会在副本之间无限回弹。
+func (s *SettingService) reloadCachedSettingsFromStore() {
+	if s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), settingsReloadTimeout)
+	defer cancel()
+	stored, err := s.GetAllSettings(ctx)
+	if err != nil {
+		slog.Warn("reload cached settings after peer invalidation failed", "error", err)
+		return
+	}
+	s.refreshCachedSettings(stored)
+}
+
+// broadcastSettingsInvalidation 通知其余副本回读设置。
+// 本副本的刷新已经在调用方用手里的新值完成，这里只负责广播。
+func (s *SettingService) broadcastSettingsInvalidation(ctx context.Context) {
+	if s == nil || s.snapshotInvalidator == nil {
+		return
+	}
+	s.snapshotInvalidator.InvalidateAndBroadcast(ctx)
+}
+
+// settingsReloadTimeout 限制订阅回调里回读设置的耗时，避免订阅循环被慢查询卡死。
+const settingsReloadTimeout = 10 * time.Second

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -17,7 +18,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
@@ -230,10 +231,16 @@ func TestDatabaseConnection(cfg *DatabaseConfig) error {
 		// Note: Database names cannot be parameterized, but we've already validated cfg.DBName
 		// in the handler using validateDBName() which only allows [a-zA-Z][a-zA-Z0-9_]*
 		_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE %s", cfg.DBName))
-		if err != nil {
+		switch {
+		case err == nil:
+			logger.LegacyPrintf("setup", "Database '%s' created successfully", cfg.DBName)
+		case isDuplicateDatabaseError(err):
+			// 多副本冷启动时会同时通过上面的存在性检查并一起 CREATE DATABASE。
+			// 42P04 说明另一个实例已经建好了，目标状态已达成，不是失败。
+			logger.LegacyPrintf("setup", "Database '%s' already created by another instance", cfg.DBName)
+		default:
 			return fmt.Errorf("failed to create database '%s': %w", cfg.DBName, err)
 		}
-		logger.LegacyPrintf("setup", "Database '%s' created successfully", cfg.DBName)
 	}
 
 	// Now connect to the target database to verify
@@ -440,10 +447,15 @@ func createAdminUser(cfg *SetupConfig) (bool, string, error) {
 		return false, "", err
 	}
 
-	_, err = db.ExecContext(
+	// ON CONFLICT 让插入变成幂等操作：多副本冷启动时所有实例都会通过上面的
+	// COUNT 检查并一起插入，唯一索引 users_email_unique_active 只会放行一个。
+	// 输家拿到 0 行影响而不是 23505 错误，从而不会把「别人已经建好了」当成致命失败
+	// （AutoSetupFromEnv 的错误会一路冒泡到 log.Fatalf 导致 CrashLoop）。
+	result, err := db.ExecContext(
 		ctx,
 		`INSERT INTO users (email, password_hash, role, balance, concurrency, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT (email) WHERE deleted_at IS NULL DO NOTHING`,
 		admin.Email,
 		admin.PasswordHash,
 		admin.Role,
@@ -456,7 +468,34 @@ func createAdminUser(cfg *SetupConfig) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	return true, decision.reason, nil
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, "", err
+	}
+	created, reason := adminBootstrapOutcome(rows, decision.reason)
+	return created, reason, nil
+}
+
+// adminBootstrapOutcome 把幂等插入的影响行数翻译成引导结果。
+// 0 行意味着另一个实例在本实例 COUNT 之后、INSERT 之前抢先建好了管理员——
+// 这是多副本冷启动的正常竞态结果，等价于「管理员已存在」，不是错误。
+func adminBootstrapOutcome(rowsAffected int64, decisionReason string) (bool, string) {
+	if rowsAffected == 0 {
+		return false, adminBootstrapReasonAdminExists
+	}
+	return true, decisionReason
+}
+
+// isDuplicateDatabaseError 判断错误是否为 Postgres 的 42P04 duplicate_database。
+func isDuplicateDatabaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "42P04"
+	}
+	return false
 }
 
 func writeConfigFile(cfg *SetupConfig) error {

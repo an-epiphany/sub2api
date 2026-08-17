@@ -276,10 +276,11 @@ jobs:
           if [[ $DECISION == retry-release ]]; then
             run_event=workflow_dispatch
             run_started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            # 不传 simple_release：让 release.yml 回落到 vars.SIMPLE_RELEASE，
+            # 保证 retry 路径与 tag push 路径用同一个架构开关，不会各说各话。
             gh workflow run release.yml \
               --ref "$TARGET_TAG" \
-              -f tag="$TARGET_TAG" \
-              -f simple_release=true
+              -f tag="$TARGET_TAG"
           else
             run_event=push
             run_started_at=$PUBLISH_TIME

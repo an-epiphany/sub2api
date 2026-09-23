@@ -499,7 +499,10 @@ test_orchestration_contract() {
     return 1
   fi
   rg -q 'release\.yml' "$workflow"
-  rg -q 'simple_release=true' "$workflow"
+  if rg -q -- '-f simple_release=' "$workflow"; then
+    printf 'Release retries must inherit the same SIMPLE_RELEASE setting as tag pushes\n' >&2
+    return 1
+  fi
   rg -Fq 'DECISION: ${{ steps.inspect.outputs.decision }}' "$workflow"
   rg -Fq 'if [[ $DECISION == retry-release ]]; then' "$workflow"
   rg -Fq 'event=push' "$workflow"

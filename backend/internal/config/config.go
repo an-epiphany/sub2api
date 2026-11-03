@@ -2159,7 +2159,7 @@ func setDefaults() {
 
 	// Log
 	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.format", "console")
+	viper.SetDefault("log.format", defaultLogFormat)
 	viper.SetDefault("log.service_name", "sub2api")
 	viper.SetDefault("log.env", "production")
 	viper.SetDefault("log.caller", true)

@@ -106,7 +106,7 @@ func resolveLogFilePath(explicit string) string {
 func bootstrapOptions() InitOptions {
 	return InitOptions{
 		Level:       "info",
-		Format:      "console",
+		Format:      bootstrapFormat,
 		ServiceName: "sub2api",
 		Environment: "bootstrap",
 		Output: OutputOptions{

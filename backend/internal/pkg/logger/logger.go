@@ -298,6 +298,7 @@ func buildLogger(options InitOptions) (*zap.Logger, zap.AtomicLevel, error) {
 		cores = append(cores, zapcore.NewCore(enc, zapcore.Lock(os.Stdout), atomic))
 	}
 
+	cores = append(cores, buildExtraCoresLocked(atomic)...)
 	core := zapcore.NewTee(cores...)
 	if options.Sampling.Enabled {
 		core = zapcore.NewSamplerWithOptions(core, samplingTick(), options.Sampling.Initial, options.Sampling.Thereafter)

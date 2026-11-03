@@ -77,14 +77,14 @@ create_fixture() {
 
   case "$mode" in
     normal | rebase-version)
-      git -C "$seed" switch -q -c feat/openai-403-config "$base_sha"
+      git -C "$seed" switch -q -c custom-main "$base_sha"
       printf 'custom patch\n' >"$seed/backend/custom.txt"
       commit_all "$seed" 'custom patch'
       if [[ $mode == rebase-version ]]; then
         write_version "$seed" 0.1.160-custom1
         commit_all "$seed" 'old custom version'
       fi
-      git -C "$seed" push -q origin feat/openai-403-config
+      git -C "$seed" push -q origin custom-main
 
       git -C "$seed" switch -q -C upstream-main "$base_sha"
       write_version "$seed" 0.1.163
@@ -98,10 +98,10 @@ create_fixture() {
       commit_all "$seed" 'origin custom version'
       git -C "$seed" push -q origin HEAD:main
 
-      git -C "$seed" switch -q -c feat/openai-403-config
+      git -C "$seed" switch -q -c custom-main
       printf 'custom patch\n' >"$seed/backend/custom.txt"
       commit_all "$seed" 'custom patch'
-      git -C "$seed" push -q origin feat/openai-403-config
+      git -C "$seed" push -q origin custom-main
 
       git -C "$seed" switch -q -C upstream-main "$base_sha"
       write_version "$seed" 0.1.163
@@ -115,10 +115,10 @@ create_fixture() {
       commit_all "$seed" 'origin source change'
       git -C "$seed" push -q origin HEAD:main
 
-      git -C "$seed" switch -q -c feat/openai-403-config
+      git -C "$seed" switch -q -c custom-main
       printf 'custom patch\n' >"$seed/backend/custom.txt"
       commit_all "$seed" 'custom patch'
-      git -C "$seed" push -q origin feat/openai-403-config
+      git -C "$seed" push -q origin custom-main
 
       git -C "$seed" switch -q -C upstream-main "$base_sha"
       printf 'upstream change\n' >"$seed/backend/source.txt"
@@ -139,7 +139,7 @@ create_fixture() {
   git -C "$fixture/runner" remote add upstream "$fixture/upstream.git"
   git -C "$fixture/runner" fetch -q origin \
     '+refs/heads/main:refs/remotes/origin/main' \
-    '+refs/heads/feat/openai-403-config:refs/remotes/origin/feat/openai-403-config'
+    '+refs/heads/custom-main:refs/remotes/origin/custom-main'
   git -C "$fixture/runner" fetch -q upstream \
     '+refs/heads/main:refs/remotes/upstream/main'
 
@@ -299,7 +299,7 @@ test_atomic_publication() {
   publish_fixture
 
   assert_eq "$PUBLICATION_PREPARED_MAIN" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
-  assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/custom-main)"
   assert_eq tag "$(git --git-dir="$PUBLICATION_FIXTURE/origin.git" cat-file -t "refs/tags/$PUBLICATION_TAG")"
   tag_target=$(git --git-dir="$PUBLICATION_FIXTURE/origin.git" rev-parse "refs/tags/$PUBLICATION_TAG^{}")
   assert_eq "$PUBLICATION_PREPARED_CUSTOM" "$tag_target"
@@ -362,7 +362,7 @@ test_main_lease_rejects_publication() {
 
   assert_fails publish_fixture
   assert_eq "$concurrent_sha" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
-  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/custom-main)"
   assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
 }
 
@@ -401,7 +401,7 @@ EOF
   unset REAL_GIT RACE_ORIGIN RACE_MAIN_SHA
 
   assert_eq "$rewound_main" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
-  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/custom-main)"
   assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
 }
 
@@ -412,7 +412,7 @@ test_candidate_mismatch_rejects_publication() {
 
   assert_fails publish_fixture
   assert_eq "$PUBLICATION_ORIGIN_MAIN" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/main)"
-  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/feat/openai-403-config)"
+  assert_eq "$PUBLICATION_ORIGIN_CUSTOM" "$(bare_ref "$PUBLICATION_FIXTURE" refs/heads/custom-main)"
   assert_missing_bare_ref "$PUBLICATION_FIXTURE" "refs/tags/$PUBLICATION_TAG"
 }
 

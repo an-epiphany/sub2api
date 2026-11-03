@@ -4,7 +4,7 @@ set -euo pipefail
 
 VERSION_FILE=backend/cmd/server/VERSION
 MAIN_BRANCH=main
-CUSTOM_BRANCH=feat/openai-403-config
+CUSTOM_BRANCH=custom-main
 CUSTOM_SUFFIX=custom1
 CANDIDATE_PREFIX=automation/upstream-sync-
 PREPARED_MAIN_BRANCH=automation-prepared-main

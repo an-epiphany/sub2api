@@ -23,7 +23,7 @@ permissions:
 env:
   UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
   MAIN_BRANCH: main
-  CUSTOM_BRANCH: feat/openai-403-config
+  CUSTOM_BRANCH: custom-main
   VERSION_FILE: backend/cmd/server/VERSION
   CANDIDATE_BRANCH: automation/upstream-sync-${{ github.run_id }}-${{ github.run_attempt }}
   GH_TOKEN: ${{ secrets.SUB2API_PAT }}

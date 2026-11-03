@@ -11,6 +11,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.uber.org/zap"
@@ -63,10 +64,10 @@ func installLogRecorder(t *testing.T) *memoryLogExporter {
 	return exp
 }
 
-func recordAttrs(r sdklog.Record) map[string]log.Value {
-	attrs := map[string]log.Value{}
-	r.WalkAttributes(func(kv log.KeyValue) bool {
-		attrs[kv.Key] = kv.Value
+func recordAttrs(r sdklog.Record) map[string]attribute.Value {
+	attrs := map[string]attribute.Value{}
+	r.WalkAttributes(func(kv attribute.KeyValue) bool {
+		attrs[string(kv.Key)] = kv.Value
 		return true
 	})
 	return attrs

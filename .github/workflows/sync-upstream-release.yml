@@ -56,8 +56,8 @@ jobs:
             "+refs/heads/${MAIN_BRANCH}:refs/remotes/origin/${MAIN_BRANCH}" \
             "+refs/heads/${CUSTOM_BRANCH}:refs/remotes/origin/${CUSTOM_BRANCH}" \
             "+refs/tags/*:refs/tags/*"
+          # 只取上游 tag：同步基准是上游已发布的版本 tag，不是上游 main（main 上可能有未发布的提交和迁移）。
           git fetch --force --prune upstream \
-            "+refs/heads/${MAIN_BRANCH}:refs/remotes/upstream/${MAIN_BRANCH}" \
             "+refs/tags/*:refs/tags/*"
 
       - name: Remove stale candidate branches
@@ -70,7 +70,9 @@ jobs:
         run: |
           set -euo pipefail
           releases_file=$(mktemp)
-          upstream_version=$(git show "upstream/${MAIN_BRANCH}:${VERSION_FILE}" | tr -d '\r\n')
+          # 上游最新正式发布（releases/latest 不含 draft 和 pre-release）。
+          upstream_tag=$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')
+          upstream_version=$(.github/scripts/sync-upstream.sh release-version "$upstream_tag")
 
           gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
@@ -199,14 +201,14 @@ jobs:
             if [[ -n $LATEST_VERSION ]] \
                 && git rev-parse --verify --quiet "refs/tags/v${LATEST_VERSION}^{commit}" >/dev/null; then
               git log --format='- %s' -n 100 \
-                "v${LATEST_VERSION}..upstream/${MAIN_BRANCH}" >>"$message_file"
+                "v${LATEST_VERSION}..${upstream_tag}" >>"$message_file"
               printf '\n[Compare upstream changes](https://github.com/%s/compare/v%s...v%s)\n' \
                 "$UPSTREAM_REPOSITORY" "$LATEST_VERSION" "$UPSTREAM_VERSION" \
                 >>"$message_file"
             else
-              git log --format='- %s' -n 100 "upstream/${MAIN_BRANCH}" >>"$message_file"
+              git log --format='- %s' -n 100 "$upstream_tag" >>"$message_file"
               printf '\n[View upstream history](https://github.com/%s/commits/%s)\n' \
-                "$UPSTREAM_REPOSITORY" "$MAIN_BRANCH" >>"$message_file"
+                "$UPSTREAM_REPOSITORY" "$upstream_tag" >>"$message_file"
             fi
           fi
 

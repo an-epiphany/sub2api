@@ -132,6 +132,14 @@ create_fixture() {
       ;;
   esac
 
+  # Upstream publishes 0.1.163 as an annotated release tag, then keeps
+  # committing to main. The sync must take the tag, never the newer main.
+  git -C "$seed" tag -a v0.1.163 -m 'upstream release 0.1.163'
+  git -C "$seed" push -q upstream refs/tags/v0.1.163
+  printf 'unreleased change\n' >"$seed/backend/unreleased.txt"
+  commit_all "$seed" 'upstream unreleased'
+  git -C "$seed" push -q upstream HEAD:main
+
   git --git-dir="$fixture/origin.git" symbolic-ref HEAD refs/heads/main
   git --git-dir="$fixture/upstream.git" symbolic-ref HEAD refs/heads/main
   git clone -q "$fixture/origin.git" "$fixture/runner"
@@ -140,8 +148,10 @@ create_fixture() {
   git -C "$fixture/runner" fetch -q origin \
     '+refs/heads/main:refs/remotes/origin/main' \
     '+refs/heads/custom-main:refs/remotes/origin/custom-main'
+  # Fetch upstream main as well, so tests prove prepare ignores it even when present.
   git -C "$fixture/runner" fetch -q upstream \
-    '+refs/heads/main:refs/remotes/upstream/main'
+    '+refs/heads/main:refs/remotes/upstream/main' \
+    '+refs/tags/*:refs/tags/*'
 
   FIXTURE_RUNNER="$fixture/runner"
 }
@@ -235,6 +245,11 @@ test_version_state() {
   assert_fails "$SCRIPT" classify invalid 0.1.160 false false
   assert_fails "$SCRIPT" classify 0.1.163 invalid false false
   assert_fails "$SCRIPT" classify 0.1.163 0.1.160 maybe false
+
+  assert_eq 0.1.163 "$("$SCRIPT" release-version v0.1.163)"
+  assert_fails "$SCRIPT" release-version 0.1.163
+  assert_fails "$SCRIPT" release-version v0.1.163-beta.1
+  assert_fails "$SCRIPT" release-version ''
 }
 
 test_normal_preparation() {
@@ -253,6 +268,17 @@ test_normal_preparation() {
   assert_eq 'custom patch' "$(git -C "$FIXTURE_RUNNER" show "$custom_sha:backend/custom.txt")"
   assert_eq 'upstream change' "$(git -C "$FIXTURE_RUNNER" show "$custom_sha:backend/upstream.txt")"
   assert_eq v0.1.163-custom1 "$(value_for target_tag "$output")"
+  # Commits on upstream main after the release tag must not be shipped.
+  assert_fails git -C "$FIXTURE_RUNNER" cat-file -e "$main_sha:backend/unreleased.txt"
+  assert_fails git -C "$FIXTURE_RUNNER" cat-file -e "$custom_sha:backend/unreleased.txt"
+}
+
+test_missing_release_tag_fails() {
+  create_fixture missing-tag normal
+  assert_fails run_prepare "$FIXTURE_RUNNER" 0.1.164 automation/upstream-sync-test
+  # Nothing was merged when the tag is missing.
+  assert_eq "$(git -C "$FIXTURE_RUNNER" rev-parse origin/main)" \
+    "$(git -C "$FIXTURE_RUNNER" rev-parse HEAD)"
 }
 
 test_merge_version_conflict() {
@@ -486,6 +512,12 @@ test_orchestration_contract() {
   local workflow="$ROOT/.github/workflows/sync-upstream-release.yml"
 
   [[ -f $workflow ]]
+  rg -Fq 'repos/${UPSTREAM_REPOSITORY}/releases/latest' "$workflow"
+  rg -Fq '.github/scripts/sync-upstream.sh release-version "$upstream_tag"' "$workflow"
+  if rg -Fq 'upstream/${MAIN_BRANCH}' "$workflow"; then
+    printf 'workflow still syncs from upstream main instead of the release tag\n' >&2
+    return 1
+  fi
   rg -q "cron: '17 1 \* \* \*'" "$workflow"
   rg -q '^  workflow_dispatch:' "$workflow"
   rg -q 'cancel-in-progress: false' "$workflow"
@@ -529,6 +561,7 @@ test_orchestration_contract() {
 
 test_version_state
 test_normal_preparation
+test_missing_release_tag_fails
 test_merge_version_conflict
 test_rebase_version_conflict
 test_source_conflict_fails

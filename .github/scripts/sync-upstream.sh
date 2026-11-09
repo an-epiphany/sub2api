@@ -23,6 +23,17 @@ validate_bool() {
   [[ ${1:-} == true || ${1:-} == false ]] || die "invalid boolean: ${1:-<empty>}"
 }
 
+# An upstream version is defined by its published release tag (vX.Y.Z), not by
+# upstream main: main may already carry unreleased commits such as migrations.
+release_version() {
+  [[ ${1:-} =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || die "invalid upstream release tag: ${1:-<empty>}"
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+upstream_release_ref() {
+  printf 'refs/tags/v%s\n' "$1"
+}
+
 compare_versions() {
   local left=$1
   local right=$2
@@ -145,10 +156,11 @@ only_version_conflicted() {
 }
 
 merge_upstream() {
+  local upstream_ref=$1
   local merge_status
 
   set +e
-  GIT_MERGE_AUTOEDIT=no git merge --no-edit "upstream/$MAIN_BRANCH" >&2
+  GIT_MERGE_AUTOEDIT=no git merge --no-edit "$upstream_ref" >&2
   merge_status=$?
   set -e
 
@@ -161,7 +173,7 @@ merge_upstream() {
     die 'upstream merge has conflicts outside the VERSION file'
   fi
 
-  git show "upstream/$MAIN_BRANCH:$VERSION_FILE" >"$VERSION_FILE"
+  git show "$upstream_ref:$VERSION_FILE" >"$VERSION_FILE"
   git add "$VERSION_FILE"
   GIT_EDITOR=true git commit --no-edit >&2
 }
@@ -207,6 +219,7 @@ prepare() {
   local prepared_main_sha
   local prepared_custom_sha
   local target_version
+  local upstream_ref
 
   validate_version "$upstream_version"
   [[ $candidate_branch == "$CANDIDATE_PREFIX"* ]] || die "invalid candidate branch: $candidate_branch"
@@ -214,10 +227,12 @@ prepare() {
 
   origin_main_sha=$(git rev-parse --verify "origin/$MAIN_BRANCH")
   origin_custom_sha=$(git rev-parse --verify "origin/$CUSTOM_BRANCH")
-  git rev-parse --verify "upstream/$MAIN_BRANCH" >/dev/null
+  upstream_ref=$(upstream_release_ref "$upstream_version")
+  git rev-parse --verify --quiet "${upstream_ref}^{commit}" >/dev/null \
+    || die "upstream release tag not found: v$upstream_version"
 
   git switch -C "$PREPARED_MAIN_BRANCH" "$origin_main_sha" >&2
-  merge_upstream
+  merge_upstream "$upstream_ref"
   prepared_main_sha=$(git rev-parse HEAD)
 
   git switch -C "$PREPARED_CUSTOM_BRANCH" "$origin_custom_sha" >&2
@@ -322,6 +337,10 @@ case "$command" in
   latest-release)
     [[ $# == 0 ]] || die 'latest-release takes no arguments'
     latest_release
+    ;;
+  release-version)
+    [[ $# == 1 ]] || die 'usage: release-version UPSTREAM_RELEASE_TAG'
+    release_version "$@"
     ;;
   classify)
     [[ $# == 4 ]] || die 'usage: classify UPSTREAM LATEST TAG_EXISTS RELEASE_EXISTS'

@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -65,7 +66,7 @@ func (t *upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 	resp, err := t.base.RoundTrip(req.WithContext(ctx))
 	if err != nil {
-		endWithError(span, err)
+		endSpan(ctx, span, err)
 		return resp, err
 	}
 
@@ -77,7 +78,7 @@ func (t *upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		span.End()
 		return resp, nil
 	}
-	resp.Body = &spanBody{ReadCloser: resp.Body, span: span}
+	resp.Body = &spanBody{ReadCloser: resp.Body, ctx: ctx, span: span}
 	return resp, nil
 }
 
@@ -85,6 +86,7 @@ func (t *upstreamTransport) RoundTrip(req *http.Request) (*http.Response, error)
 // closed, whichever happens first.
 type spanBody struct {
 	io.ReadCloser
+	ctx       context.Context
 	span      trace.Span
 	firstByte bool
 	once      sync.Once
@@ -113,23 +115,26 @@ func (b *spanBody) Close() error {
 }
 
 func (b *spanBody) end(err error) {
-	b.once.Do(func() {
-		if err != nil {
-			endWithError(b.span, err)
-			return
-		}
-		b.span.End()
-	})
+	b.once.Do(func() { endSpan(b.ctx, b.span, err) })
 }
 
-func endWithError(span trace.Span, err error) {
-	// *url.Error embeds the full request URL, query string included.
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) && urlErr.Err != nil {
-		err = urlErr.Err
+// endSpan ends an upstream span, marking err as an error unless the request
+// context was cancelled. A cancelled request was stopped by the gateway, not
+// failed by the upstream: the gateway cancels an attempt when it is done with
+// it (for example, it closes the body right after a terminal SSE event, which
+// cancels the request first) or when the client has left. Reads still in
+// flight at that point, such as the zstd decoder's read-ahead, then fail with
+// context.Canceled. A deadline is still an error: the upstream was too slow.
+func endSpan(ctx context.Context, span trace.Span, err error) {
+	if err != nil && !errors.Is(ctx.Err(), context.Canceled) {
+		// *url.Error embeds the full request URL, query string included.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Err != nil {
+			err = urlErr.Err
+		}
+		span.SetAttributes(semconv.ErrorType(err))
+		span.SetStatus(codes.Error, err.Error())
 	}
-	span.SetAttributes(semconv.ErrorType(err))
-	span.SetStatus(codes.Error, err.Error())
 	span.End()
 }
 

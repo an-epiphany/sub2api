@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -455,6 +456,109 @@ func TestUpstreamSpanMarksHTTPErrors(t *testing.T) {
 	resp, err := InstrumentUpstreamClient(upstream.Client(), 1).Do(req)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
+
+	spans := rec.Ended()
+	require.Len(t, spans, 1)
+	require.Equal(t, codes.Error, spans[0].Status().Code)
+}
+
+// cancelWaitBody delivers one chunk, then blocks like a network read until
+// the request context is done, returning its error as net/http does.
+type cancelWaitBody struct {
+	ctx     context.Context
+	reading chan struct{}
+	served  bool
+}
+
+func (b *cancelWaitBody) Read(p []byte) (int, error) {
+	if !b.served {
+		b.served = true
+		return copy(p, "data: done\n\n"), nil
+	}
+	close(b.reading)
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *cancelWaitBody) Close() error { return nil }
+
+// The gateway cancels an attempt itself: it closes the body right after a
+// terminal SSE event (cancelling the request first), or the client leaves. A
+// read still in flight at that moment, such as the zstd decoder's read-ahead,
+// fails with context.Canceled. That is not an upstream error.
+func TestUpstreamSpanLocalCancellationIsNotAnError(t *testing.T) {
+	rec := installRecorder(t)
+	var body *cancelWaitBody
+	client := InstrumentUpstreamClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body = &cancelWaitBody{ctx: req.Context(), reading: make(chan struct{})}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body, Request: req}, nil
+	})}, 7)
+
+	parentCtx, parent := parentContext(t)
+	defer parent.End()
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+
+	buf := make([]byte, 64)
+	_, err = resp.Body.Read(buf)
+	require.NoError(t, err)
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := resp.Body.Read(buf)
+		readErr <- err
+	}()
+	<-body.reading
+	cancel()
+	require.ErrorIs(t, <-readErr, context.Canceled)
+	require.NoError(t, resp.Body.Close())
+
+	spans := rec.Ended()
+	require.Len(t, spans, 1)
+	require.Equal(t, codes.Unset, spans[0].Status().Code)
+}
+
+func TestUpstreamSpanCancelledBeforeResponseIsNotAnError(t *testing.T) {
+	rec := installRecorder(t)
+	client := InstrumentUpstreamClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}, 7)
+
+	parentCtx, parent := parentContext(t)
+	defer parent.End()
+	ctx, cancel := context.WithCancel(parentCtx)
+	cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	require.NoError(t, err)
+	_, err = client.Do(req) //nolint:bodyclose // the request fails, there is no body
+	require.ErrorIs(t, err, context.Canceled)
+
+	spans := rec.Ended()
+	require.Len(t, spans, 1)
+	require.Equal(t, codes.Unset, spans[0].Status().Code)
+}
+
+// A deadline is a timeout, not a cancellation: the upstream was too slow.
+func TestUpstreamSpanDeadlineIsAnError(t *testing.T) {
+	rec := installRecorder(t)
+	client := InstrumentUpstreamClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}, 7)
+
+	parentCtx, parent := parentContext(t)
+	defer parent.End()
+	ctx, cancel := context.WithDeadline(parentCtx, time.Now())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+	require.NoError(t, err)
+	_, err = client.Do(req) //nolint:bodyclose // the request fails, there is no body
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	spans := rec.Ended()
 	require.Len(t, spans, 1)

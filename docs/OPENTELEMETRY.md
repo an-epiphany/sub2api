@@ -63,6 +63,7 @@ traceparent: 00-<32 位十六进制 trace_id>-<16 位十六进制 span_id>-01
 
 - `http.request.method`、`http.route`、`url.path`、`http.response.status_code`、`client.address`、`user_agent.original`
 - `sub2api.account_id`、`sub2api.user_id`、`sub2api.platform`、`gen_ai.request.model`：最终命中的账号、用户、平台和模型
+- `sub2api.api_key.id`、`sub2api.api_key.name`、`sub2api.api_key.masked`：请求使用的 API Key，脱敏后只保留末 4 位；Key 存在但请求被拒绝（额度、IP 规则等）时也会记录
 - 5xx 响应标记为错误
 - 流式（SSE）和 WebSocket 请求的 span 持续到连接结束
 
@@ -72,6 +73,8 @@ traceparent: 00-<32 位十六进制 trace_id>-<16 位十六进制 span_id>-01
 - 流式响应的 span 持续到响应体读完；`first_byte` 事件标出首字节时间
 - `url.full` 不包含 query string（有的上游会把 API key 放在 query 里）
 - 4xx/5xx、网络错误和超时标记为错误；网关自己取消的请求不算错误，比如读到结束事件后提前关闭响应、客户端已断开
+
+**账号名称**：span 上只有账号 ID。名称在同一条链路的日志里：每次选定账号（包括换号重试）都会输出一条 `*.account_selected` 日志，带 `account_id` 和 `account_name`。覆盖 OpenAI 网关的 Responses（含 WebSocket）、Messages、Chat Completions、生图入口，以及 Claude 的 Messages 入口（`sticky.account_selected`）。
 
 **不会记录的请求**：`/health`、`/setup/status`、没有匹配到路由的请求（前端静态资源、404），以及不在入口请求内的后台上游调用（定时任务等）。
 

@@ -335,6 +335,28 @@ func TestMiddlewareDisabledPassesThrough(t *testing.T) {
 	require.False(t, sawSpan)
 }
 
+func TestMiddlewareRecordsRequestAttributesAfterHandlers(t *testing.T) {
+	rec := installRecorder(t)
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(Middleware(func(c *gin.Context) []attribute.KeyValue {
+		// Runs after the handlers, so it sees what they recorded.
+		return []attribute.KeyValue{AttrAPIKeyID.Int64(c.GetInt64("api_key_id"))}
+	}))
+	r.POST("/v1/messages", func(c *gin.Context) {
+		c.Set("api_key_id", int64(121))
+		c.Status(http.StatusOK)
+	})
+
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+
+	spans := rec.Ended()
+	require.Len(t, spans, 1)
+	got, ok := attrValue(spans[0].Attributes(), AttrAPIKeyID)
+	require.True(t, ok)
+	require.Equal(t, int64(121), got.AsInt64())
+}
+
 // parentContext returns a context carrying a recorded server span, as the
 // middleware would provide to handlers.
 func parentContext(t *testing.T) (context.Context, trace.Span) {

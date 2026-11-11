@@ -23,6 +23,19 @@ const (
 	attrModel     = attribute.Key("gen_ai.request.model")
 )
 
+// Attribute keys for the API key a request was made with, for
+// RequestAttributes.
+const (
+	AttrAPIKeyID     = attribute.Key("sub2api.api_key.id")
+	AttrAPIKeyName   = attribute.Key("sub2api.api_key.name")
+	AttrAPIKeyMasked = attribute.Key("sub2api.api_key.masked")
+)
+
+// RequestAttributes returns extra attributes for a request's server span. It
+// runs after the handlers, so it sees what they and the auth middleware
+// recorded on the gin context, and only for requests that are traced.
+type RequestAttributes func(c *gin.Context) []attribute.KeyValue
+
 // Middleware starts a server span for each routed request. The span continues
 // the caller's trace when the request carries a W3C traceparent header. The
 // trace context is added to the request-scoped logger, so it must run after
@@ -30,7 +43,7 @@ const (
 //
 // Requests without a matched route (embedded frontend assets, 404s) and health
 // probes are not traced.
-func Middleware() gin.HandlerFunc {
+func Middleware(extra ...RequestAttributes) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		state := active.Load()
 		route := c.FullPath()
@@ -72,6 +85,9 @@ func Middleware() gin.HandlerFunc {
 		// Handlers record the routing result on the request context; read it
 		// from c.Request, which downstream middleware may have replaced.
 		span.SetAttributes(gatewayAttributes(c.Request)...)
+		for _, attrs := range extra {
+			span.SetAttributes(attrs(c)...)
+		}
 		if status >= http.StatusInternalServerError {
 			span.SetStatus(codes.Error, http.StatusText(status))
 		}
